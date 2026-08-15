@@ -51,10 +51,6 @@ final class LanguageSettings: ObservableObject {
     }
 }
 
-private func localized(_ chinese: String, _ english: String) -> String {
-    LanguageSettings.shared.text(chinese, english)
-}
-
 @main
 struct TodoBarApp: App {
     @StateObject private var model = TodoBarModel()
@@ -88,7 +84,7 @@ final class TodoBarServices {
     private weak var taskStore: TaskStore?
     private let hotKeyManager = GlobalHotKeyManager()
     private let quickCaptureController = QuickCaptureController()
-    private let reminderScheduler = ReminderScheduler()
+    private let eveningReminderController = EveningReminderController()
     private var isConfigured = false
 
     func configure(with taskStore: TaskStore) {
@@ -101,10 +97,10 @@ final class TodoBarServices {
             self.quickCaptureController.show()
         }
 
-        reminderScheduler.requestAuthorizationIfNeeded()
-        reminderScheduler.reschedule(tasks: taskStore.tasks)
+        LegacyNotificationCleaner.clearTodoBarNotifications()
+        eveningReminderController.configure(with: taskStore)
         taskStore.onTasksChanged = { [weak self] tasks in
-            self?.reminderScheduler.reschedule(tasks: tasks)
+            self?.eveningReminderController.handleTaskChange(tasks)
         }
     }
 }
@@ -145,7 +141,7 @@ final class GlobalHotKeyManager {
             return
         }
 
-        var hotKeyID = EventHotKeyID(signature: OSType(0x54424B31), id: 1)
+        let hotKeyID = EventHotKeyID(signature: OSType(0x54424B31), id: 1)
         let modifierFlags = UInt32(optionKey | cmdKey)
         let registerStatus = RegisterEventHotKey(
             UInt32(kVK_ANSI_T),
@@ -294,122 +290,230 @@ struct QuickCaptureView: View {
     }
 }
 
-final class ReminderScheduler: NSObject, UNUserNotificationCenterDelegate {
-    private let center = UNUserNotificationCenter.current()
-    private let identifierPrefix = "local.todobar.reminder."
-    private let defaults = UserDefaults.standard
+private enum LegacyNotificationCleaner {
+    private static let identifierPrefix = "local.todobar.reminder."
 
-    override init() {
-        super.init()
-        center.delegate = self
-    }
-
-    func requestAuthorizationIfNeeded() {
-        center.getNotificationSettings { [weak self] settings in
-            guard settings.authorizationStatus == .notDetermined else { return }
-            self?.center.requestAuthorization(options: [.alert, .sound]) { granted, error in
-                if let error {
-                    NSLog("TodoBar: notification authorization failed (\(error.localizedDescription))")
-                } else if !granted {
-                    NSLog("TodoBar: notification authorization was declined")
-                }
-            }
-        }
-    }
-
-    func reschedule(tasks: [TodoItem]) {
-        center.getPendingNotificationRequests { [weak self] requests in
-            guard let self else { return }
+    static func clearTodoBarNotifications() {
+        let center = UNUserNotificationCenter.current()
+        center.getPendingNotificationRequests { requests in
             let identifiers = requests
                 .map(\.identifier)
-                .filter { $0.hasPrefix(self.identifierPrefix) }
-            self.center.removePendingNotificationRequests(withIdentifiers: identifiers)
-
-            for task in tasks where !task.isCompleted {
-                self.scheduleReminders(for: task)
-            }
+                .filter { $0.hasPrefix(identifierPrefix) }
+            center.removePendingNotificationRequests(withIdentifiers: identifiers)
+            center.removeDeliveredNotifications(withIdentifiers: identifiers)
         }
-    }
-
-    private func scheduleReminders(for task: TodoItem) {
-        guard let dueDate = task.dueDate else { return }
-
-        let calendar = Calendar.current
-        let now = Date()
-        let today = calendar.startOfDay(for: now)
-        let dueDay = calendar.startOfDay(for: dueDate)
-
-        if dueDay > today {
-            if let dayBefore = calendar.date(byAdding: .day, value: -1, to: dueDay),
-               let previewDate = calendar.date(bySettingHour: 18, minute: 0, second: 0, of: dayBefore),
-               previewDate > now {
-                schedule(task: task, kind: "before", title: localized("明天到期", "Due tomorrow"), body: localized("“\(task.title)”将在明天到期。", "“\(task.title)” is due tomorrow."), trigger: .calendar(previewDate))
-            }
-
-            if let dueMorning = calendar.date(bySettingHour: 9, minute: 0, second: 0, of: dueDay), dueMorning > now {
-                schedule(task: task, kind: "due", title: localized("今天安排", "Scheduled today"), body: localized("“\(task.title)”安排在今天完成。", "“\(task.title)” is scheduled for today."), trigger: .calendar(dueMorning))
-            }
-            return
-        }
-
-        if dueDay == today,
-           let dueMorning = calendar.date(bySettingHour: 9, minute: 0, second: 0, of: dueDay),
-           dueMorning > now {
-            schedule(task: task, kind: "due", title: localized("今天安排", "Scheduled today"), body: localized("“\(task.title)”安排在今天完成。", "“\(task.title)” is scheduled for today."), trigger: .calendar(dueMorning))
-            return
-        }
-
-        let dateKey = ISO8601DateFormatter().string(from: today)
-        let immediateKey = "TodoBar.didScheduleImmediate.\(task.id.uuidString).\(dateKey)"
-        if !defaults.bool(forKey: immediateKey) {
-            defaults.set(true, forKey: immediateKey)
-            let title = dueDay < today ? localized("已有逾期待办", "Overdue task") : localized("今天还有待办", "Task still due today")
-            let body = dueDay < today ? localized("“\(task.title)”仍等待处理。", "“\(task.title)” still needs attention.") : localized("“\(task.title)”还没有完成。", "“\(task.title)” is not completed yet.")
-            schedule(task: task, kind: "now", title: title, body: body, trigger: .interval(6))
-        }
-
-        if dueDay < today {
-            schedule(task: task, kind: "overdue", title: localized("仍有逾期待办", "Overdue task remains"), body: localized("“\(task.title)”仍等待处理。", "“\(task.title)” still needs attention."), trigger: .daily(hour: 9))
-        }
-    }
-
-    private func schedule(task: TodoItem, kind: String, title: String, body: String, trigger: ReminderTrigger) {
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        content.sound = .default
-        content.categoryIdentifier = "TODOBAR_TASK"
-
-        let notificationTrigger: UNNotificationTrigger
-        switch trigger {
-        case .calendar(let date):
-            notificationTrigger = UNCalendarNotificationTrigger(
-                dateMatching: Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: date),
-                repeats: false
-            )
-        case .interval(let seconds):
-            notificationTrigger = UNTimeIntervalNotificationTrigger(timeInterval: seconds, repeats: false)
-        case .daily(let hour):
-            notificationTrigger = UNCalendarNotificationTrigger(dateMatching: DateComponents(hour: hour, minute: 0), repeats: true)
-        }
-
-        let identifier = "\(identifierPrefix)\(task.id.uuidString).\(kind)"
-        center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: notificationTrigger)) { error in
-            if let error {
-                NSLog("TodoBar: unable to schedule reminder (\(error.localizedDescription))")
-            }
-        }
-    }
-
-    func userNotificationCenter(_: UNUserNotificationCenter, willPresent _: UNNotification) async -> UNNotificationPresentationOptions {
-        [.banner, .sound]
     }
 }
 
-private enum ReminderTrigger {
-    case calendar(Date)
-    case interval(TimeInterval)
-    case daily(hour: Int)
+@MainActor
+final class EveningReminderController {
+    private weak var taskStore: TaskStore?
+    private var scheduleTimer: Timer?
+    private var snoozeTimer: Timer?
+    private var panel: NSPanel?
+    private let defaults = UserDefaults.standard
+    private let reminderDayKey = "TodoBar.eveningReminderDay"
+
+    func configure(with taskStore: TaskStore) {
+        self.taskStore = taskStore
+        scheduleNextCheck()
+        checkForMissedEveningReminder()
+    }
+
+    func handleTaskChange(_ tasks: [TodoItem]) {
+        guard panel?.isVisible == true else { return }
+        let remainingTasks = dueTodayTasks(from: tasks)
+        if remainingTasks.isEmpty {
+            dismiss()
+        } else {
+            updatePanel(tasks: remainingTasks)
+        }
+    }
+
+    private func scheduleNextCheck(from now: Date = Date()) {
+        scheduleTimer?.invalidate()
+
+        let calendar = Calendar.current
+        let todayAtNine = calendar.date(bySettingHour: 21, minute: 0, second: 0, of: now) ?? now
+        let target = todayAtNine > now
+            ? todayAtNine
+            : calendar.date(byAdding: .day, value: 1, to: todayAtNine) ?? todayAtNine
+
+        scheduleTimer = Timer(fire: target, interval: 0, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.presentReminderIfNeeded()
+                self?.scheduleNextCheck()
+            }
+        }
+
+        if let scheduleTimer {
+            RunLoop.main.add(scheduleTimer, forMode: .common)
+        }
+    }
+
+    private func checkForMissedEveningReminder() {
+        let calendar = Calendar.current
+        guard calendar.component(.hour, from: Date()) >= 21 else { return }
+        presentReminderIfNeeded()
+    }
+
+    private func presentReminderIfNeeded() {
+        let dayKey = currentDayKey()
+        guard defaults.string(forKey: reminderDayKey) != dayKey else { return }
+        defaults.set(dayKey, forKey: reminderDayKey)
+
+        guard let taskStore else { return }
+        let tasks = dueTodayTasks(from: taskStore.tasks)
+        guard !tasks.isEmpty else { return }
+        show(tasks: tasks)
+    }
+
+    private func dueTodayTasks(from tasks: [TodoItem]) -> [TodoItem] {
+        let calendar = Calendar.current
+        return tasks.filter { item in
+            guard !item.isCompleted, let dueDate = item.dueDate else { return false }
+            return calendar.isDate(dueDate, inSameDayAs: Date())
+        }
+    }
+
+    private func currentDayKey() -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withFullDate]
+        return formatter.string(from: Date())
+    }
+
+    private func show(tasks: [TodoItem]) {
+        if panel == nil {
+            panel = makePanel()
+        }
+
+        updatePanel(tasks: tasks)
+        guard let panel else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        panel.center()
+        panel.orderFrontRegardless()
+    }
+
+    private func makePanel() -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 410, height: 300),
+            styleMask: [.titled, .fullSizeContentView, .utilityWindow],
+            backing: .buffered,
+            defer: false
+        )
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isMovableByWindowBackground = true
+        panel.isReleasedWhenClosed = false
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.backgroundColor = .clear
+        return panel
+    }
+
+    private func updatePanel(tasks: [TodoItem]) {
+        panel?.contentView = NSHostingView(rootView: EveningReminderView(
+            tasks: tasks,
+            onLater: { [weak self] in self?.snooze() },
+            onOpenTodoBar: { [weak self] in self?.openTodoBar() }
+        ))
+    }
+
+    private func snooze() {
+        dismiss()
+        snoozeTimer?.invalidate()
+        snoozeTimer = Timer.scheduledTimer(withTimeInterval: 1_800, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, let taskStore = self.taskStore else { return }
+                let tasks = self.dueTodayTasks(from: taskStore.tasks)
+                guard !tasks.isEmpty else { return }
+                self.show(tasks: tasks)
+            }
+        }
+    }
+
+    private func openTodoBar() {
+        dismiss()
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func dismiss() {
+        panel?.orderOut(nil)
+    }
+}
+
+struct EveningReminderView: View {
+    let tasks: [TodoItem]
+    let onLater: () -> Void
+    let onOpenTodoBar: () -> Void
+
+    @ObservedObject private var languageSettings = LanguageSettings.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top) {
+                ZStack {
+                    Circle()
+                        .fill(LinearGradient(colors: [.indigo, .blue], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .frame(width: 38, height: 38)
+                    Image(systemName: "moon.stars.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(t("晚上 9 点清单", "9 PM check-in"))
+                        .font(.system(size: 17, weight: .bold, design: .rounded))
+                    Text(t("今天还有 \(tasks.count) 件待办没有完成", "You still have \(tasks.count) tasks due today"))
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                ForEach(tasks.prefix(4)) { task in
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(task.priority.color)
+                            .frame(width: 7, height: 7)
+                        Text(task.title)
+                            .font(.system(size: 13, weight: .medium))
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                }
+
+                if tasks.count > 4 {
+                    Text(t("还有 \(tasks.count - 4) 件待办", "And \(tasks.count - 4) more tasks"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 2)
+                }
+            }
+
+            HStack {
+                Button(t("30 分钟后再提醒", "Remind me in 30 min")) { onLater() }
+                    .buttonStyle(.bordered)
+                Spacer()
+                Button(t("查看 TodoBar", "View TodoBar")) { onOpenTodoBar() }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.indigo)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(22)
+        .frame(width: 410)
+        .background(.ultraThinMaterial)
+    }
+
+    private func t(_ chinese: String, _ english: String) -> String {
+        languageSettings.text(chinese, english)
+    }
 }
 
 struct TodoItem: Identifiable, Codable, Equatable {

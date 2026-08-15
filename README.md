@@ -11,7 +11,7 @@ A lightweight native macOS menu bar to-do app for capturing work before it slips
 | Menu bar workflow | Keep the task list one click away without a Dock window. |
 | Three-step creation | Create a task in order: content, priority, then date. |
 | Global quick capture | Press `Option + Command + T` from any app to capture a task. |
-| Local reminders | Receive restrained reminders before a due date, on the due day, and for overdue tasks. |
+| Evening desktop reminder | At 9 PM, TodoBar shows its own floating desktop window for unfinished tasks due today. |
 | Date-aware groups | See **Overdue**, **Due today**, and **Upcoming** tasks separately. |
 | Bilingual UI | Switch between Simplified Chinese and English from the language control in the menu-bar panel. |
 | Local-first data | Tasks are stored locally in your Application Support directory. |
@@ -58,4 +58,4 @@ build.sh                       Local macOS build script
 
 ## Notes
 
-TodoBar uses local macOS notifications. Allow notifications in System Settings if you want deadline reminders. If `Option + Command + T` does not open quick capture, check for another app using the same shortcut.
+Keep TodoBar running if you want the 9 PM desktop reminder. It does not schedule macOS notification banners. If `Option + Command + T` does not open quick capture, check for another app using the same shortcut.
