@@ -415,7 +415,7 @@ final class EveningReminderController {
         panel?.contentView = NSHostingView(rootView: EveningReminderView(
             tasks: tasks,
             onLater: { [weak self] in self?.snooze() },
-            onOpenTodoBar: { [weak self] in self?.openTodoBar() }
+            onDismiss: { [weak self] in self?.dismiss() }
         ))
     }
 
@@ -432,11 +432,6 @@ final class EveningReminderController {
         }
     }
 
-    private func openTodoBar() {
-        dismiss()
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
     private func dismiss() {
         panel?.orderOut(nil)
     }
@@ -445,7 +440,7 @@ final class EveningReminderController {
 struct EveningReminderView: View {
     let tasks: [TodoItem]
     let onLater: () -> Void
-    let onOpenTodoBar: () -> Void
+    let onDismiss: () -> Void
 
     @ObservedObject private var languageSettings = LanguageSettings.shared
 
@@ -472,35 +467,31 @@ struct EveningReminderView: View {
                 Spacer()
             }
 
-            VStack(alignment: .leading, spacing: 7) {
-                ForEach(tasks.prefix(4)) { task in
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(task.priority.color)
-                            .frame(width: 7, height: 7)
-                        Text(task.title)
-                            .font(.system(size: 13, weight: .medium))
-                            .lineLimit(1)
-                        Spacer()
+            ScrollView(showsIndicators: tasks.count > 4) {
+                VStack(alignment: .leading, spacing: 7) {
+                    ForEach(tasks) { task in
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(task.priority.color)
+                                .frame(width: 7, height: 7)
+                            Text(task.title)
+                                .font(.system(size: 13, weight: .medium))
+                                .lineLimit(2)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                }
-
-                if tasks.count > 4 {
-                    Text(t("还有 \(tasks.count - 4) 件待办", "And \(tasks.count - 4) more tasks"))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(.leading, 2)
                 }
             }
+            .frame(maxHeight: 205)
 
             HStack {
                 Button(t("30 分钟后再提醒", "Remind me in 30 min")) { onLater() }
                     .buttonStyle(.bordered)
                 Spacer()
-                Button(t("查看 TodoBar", "View TodoBar")) { onOpenTodoBar() }
+                Button(t("知道了", "Got it")) { onDismiss() }
                     .buttonStyle(.borderedProminent)
                     .tint(.indigo)
                     .keyboardShortcut(.defaultAction)
