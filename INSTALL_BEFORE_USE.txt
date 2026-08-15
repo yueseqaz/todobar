@@ -1,0 +1,18 @@
+TodoBar — 安装前必看 / Read Before Installing
+===============================================
+
+中文
+----
+1. TodoBar 当前面向 macOS 13 及以上的 Apple Silicon（M 系列）Mac 构建。
+2. 发布包由 GitHub Actions 自动构建和临时签名，但没有 Apple Developer ID 签名或 Apple 公证。首次打开时，macOS 可能显示“无法验证开发者”或类似安全提示。这是系统的正常保护机制。
+3. 请只从本仓库的 GitHub Release 下载，并在安装前核对 Release 中 SHA256SUMS.txt 的校验值。不要从未知链接下载应用。
+4. 若确认来源可信，请在 Finder 中按住 Control 点击 TodoBar.app，选择“打开”，再在系统确认窗口中选择“打开”。不要关闭 Gatekeeper，也不要执行来源不明的“绕过安全限制”终端命令。
+5. 首次启动后，可在“系统设置 → 通知 → TodoBar”允许通知。全局快速收集快捷键为 Option + Command + T；若无响应，请检查是否与其他应用冲突。
+
+English
+-------
+1. TodoBar is currently built for Apple Silicon Macs (M-series) running macOS 13 or later.
+2. Release packages are built and ad-hoc signed by GitHub Actions, but are not signed with an Apple Developer ID or notarized by Apple. macOS may show an “unidentified developer” or similar warning on first launch. This is normal system protection.
+3. Download only from this repository’s GitHub Releases and verify the checksum in SHA256SUMS.txt before installing. Do not install from unknown links.
+4. After confirming the source is trusted, Control-click TodoBar.app in Finder, choose Open, then choose Open again in the system dialog. Do not disable Gatekeeper or run unknown terminal commands that claim to bypass security.
+5. After first launch, allow notifications in System Settings → Notifications → TodoBar if you want reminders. The global quick-capture shortcut is Option + Command + T; check for conflicts if it does not respond.
