@@ -1,6 +1,7 @@
 import SwiftUI
 import Foundation
 import AppKit
+import Combine
 import Carbon
 import UserNotifications
 
@@ -481,16 +482,22 @@ struct WidgetCollapsedBadge: View {
 
 @main
 struct TodoBarApp: App {
-    @StateObject private var model = TodoBarModel()
+    @NSApplicationDelegateAdaptor private var appDelegate: AppDelegate
 
     var body: some Scene {
-        MenuBarExtra {
-            TodoPanelView(widget: model.widgetController)
-                .environmentObject(model.taskStore)
-        } label: {
-            MenuBarLabel(remainingCount: model.taskStore.remainingCount)
-        }
-        .menuBarExtraStyle(.window)
+        // 所有窗口由 AppKit 直接管理（状态栏图标 + 面板 + 桌面小组件），这里仅保留占位 Scene
+        Settings { EmptyView() }
+    }
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var model: TodoBarModel?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let model = TodoBarModel()
+        self.model = model
+        model.statusBarController.start()
     }
 }
 
@@ -498,18 +505,276 @@ struct TodoBarApp: App {
 final class TodoBarModel: ObservableObject {
     let taskStore: TaskStore
     let widgetController: DesktopWidgetController
+    let statusBarController: StatusBarController
     private let services: TodoBarServices
 
     init() {
         let store = TaskStore()
         self.taskStore = store
         self.widgetController = DesktopWidgetController(taskStore: store)
+        self.statusBarController = StatusBarController(taskStore: store, widgetController: widgetController)
         self.services = TodoBarServices()
         self.services.configure(with: store)
 
         DispatchQueue.main.async { [weak self] in
             self?.widgetController.restoreIfNeeded()
         }
+    }
+}
+
+// MARK: - 菜单栏状态图标（左键弹出面板，右键设置与退出）
+
+@MainActor
+final class StatusBarController: NSObject, NSMenuDelegate {
+    private let taskStore: TaskStore
+    private let widgetController: DesktopWidgetController
+
+    private var statusItem: NSStatusItem?
+    private var panel: WidgetPanel?
+    private var eventMonitors: [Any] = []
+    private var iconSubscription: AnyCancellable?
+    private let contextMenu = NSMenu()
+    private var isShowingContextMenu = false
+
+    init(taskStore: TaskStore, widgetController: DesktopWidgetController) {
+        self.taskStore = taskStore
+        self.widgetController = widgetController
+        super.init()
+    }
+
+    func start() {
+        guard statusItem == nil else { return }
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem = item
+
+        if let button = item.button {
+            button.action = #selector(handleStatusItemClick)
+            button.target = self
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+
+        contextMenu.delegate = self
+        updateIcon(remaining: taskStore.remainingCount)
+
+        iconSubscription = taskStore.$tasks.receive(on: DispatchQueue.main).sink { [weak self] tasks in
+            let remaining = tasks.lazy.filter { !$0.isCompleted }.count
+            self?.updateIcon(remaining: remaining)
+        }
+    }
+
+    private func updateIcon(remaining: Int) {
+        guard let button = statusItem?.button else { return }
+        button.image = NSImage(
+            systemSymbolName: remaining == 0 ? "checkmark.circle.fill" : "checkmark.circle",
+            accessibilityDescription: remaining == 0 ? t("全部完成", "All done") : t("剩余任务", "Tasks remaining")
+        )
+        button.title = remaining > 0 ? " \(remaining)" : ""
+        button.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+    }
+
+    @objc private func handleStatusItemClick() {
+        guard !isShowingContextMenu else { return }
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showContextMenu()
+        } else {
+            togglePanel()
+        }
+    }
+
+    private func togglePanel() {
+        if panel?.isVisible == true {
+            hidePanel()
+        } else {
+            showPanel()
+        }
+    }
+
+    private func showPanel() {
+        let panel = self.panel ?? makePanel()
+        self.panel = panel
+        positionPanel(panel)
+        panel.makeKeyAndOrderFront(nil)
+        installMonitorsIfNeeded()
+    }
+
+    private func showContextMenu() {
+        hidePanel()
+        guard let statusItem else { return }
+        isShowingContextMenu = true
+        defer { isShowingContextMenu = false }
+
+        rebuildMenu()
+        statusItem.menu = contextMenu
+        statusItem.button?.performClick(nil)
+        statusItem.menu = nil
+    }
+
+    private func makePanel() -> WidgetPanel {
+        let panel = WidgetPanel(
+            contentRect: NSRect(origin: .zero, size: NSSize(width: 360, height: 460)),
+            styleMask: [.borderless, .nonactivatingPanel, .utilityWindow],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.level = .floating
+        panel.collectionBehavior = [.fullScreenAuxiliary]
+        panel.isReleasedWhenClosed = false
+
+        let hosting = NSHostingView(rootView: MenuPanelHostView(store: taskStore, widgetController: widgetController))
+        hosting.autoresizingMask = [.width, .height]
+        panel.contentView = hosting
+        return panel
+    }
+
+    /// 把面板放到状态图标正下方，越界时往屏幕内收
+    private func positionPanel(_ panel: NSPanel) {
+        guard let button = statusItem?.button, let itemWindow = button.window else {
+            panel.center()
+            return
+        }
+        let itemFrame = itemWindow.convertToScreen(button.bounds)
+        let size = panel.frame.size
+        var origin = CGPoint(x: itemFrame.midX - size.width / 2, y: itemFrame.minY - 6 - size.height)
+        if let screen = itemWindow.screen ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            origin.x = min(max(origin.x, visible.minX + 8), visible.maxX - size.width - 8)
+            origin.y = min(max(origin.y, visible.minY + 8), visible.maxY - size.height - 8)
+        }
+        panel.setFrameOrigin(origin)
+    }
+
+    private func hidePanel() {
+        panel?.orderOut(nil)
+        removeMonitors()
+    }
+
+    private func installMonitorsIfNeeded() {
+        guard eventMonitors.isEmpty else { return }
+        let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp, .rightMouseUp]) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.hidePanelIfClickedOutside()
+            }
+        }
+        let localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp, .rightMouseUp]) { [weak self] event in
+            self?.hidePanelIfClickedOutside()
+            return event
+        }
+        eventMonitors = [globalMonitor, localMonitor].compactMap { $0 }
+    }
+
+    private func removeMonitors() {
+        eventMonitors.forEach { NSEvent.removeMonitor($0) }
+        eventMonitors = []
+    }
+
+    private func hidePanelIfClickedOutside() {
+        guard let panel, panel.isVisible else { return }
+        let mouse = NSEvent.mouseLocation
+        if panel.frame.contains(mouse) { return }
+        // 点击状态图标本身时交给 toggle 处理，避免“关了又开”
+        if let button = statusItem?.button, let window = button.window,
+           window.convertToScreen(button.bounds).contains(mouse) {
+            return
+        }
+        hidePanel()
+    }
+
+    // MARK: 右键菜单
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        rebuildMenu()
+    }
+
+    private func rebuildMenu() {
+        contextMenu.removeAllItems()
+
+        let openItem = NSMenuItem(
+            title: t("打开待办面板", "Open task panel"),
+            action: #selector(openPanelFromMenu),
+            keyEquivalent: ""
+        )
+        openItem.target = self
+        contextMenu.addItem(openItem)
+
+        contextMenu.addItem(.separator())
+
+        let settingsItem = NSMenuItem(title: t("设置", "Settings"), action: nil, keyEquivalent: "")
+        let settingsMenu = NSMenu(title: t("设置", "Settings"))
+
+        let languageItem = NSMenuItem(title: t("语言", "Language"), action: nil, keyEquivalent: "")
+        let languageMenu = NSMenu(title: t("语言", "Language"))
+        for language in AppLanguage.allCases {
+            let item = NSMenuItem(
+                title: language.displayName,
+                action: #selector(selectLanguage(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = language.rawValue
+            item.state = language == LanguageSettings.shared.language ? .on : .off
+            languageMenu.addItem(item)
+        }
+        languageItem.submenu = languageMenu
+        settingsMenu.addItem(languageItem)
+
+        let widgetToggle = NSMenuItem(
+            title: t("桌面常驻小组件", "Pin to desktop"),
+            action: #selector(toggleWidgetFromMenu),
+            keyEquivalent: ""
+        )
+        widgetToggle.target = self
+        widgetToggle.state = widgetController.isEnabled ? .on : .off
+        settingsMenu.addItem(widgetToggle)
+
+        settingsItem.submenu = settingsMenu
+        contextMenu.addItem(settingsItem)
+
+        contextMenu.addItem(.separator())
+
+        let quitItem = NSMenuItem(
+            title: t("退出 TodoBar", "Quit TodoBar"),
+            action: #selector(quitApp),
+            keyEquivalent: "q"
+        )
+        quitItem.target = self
+        contextMenu.addItem(quitItem)
+    }
+
+    @objc private func openPanelFromMenu() {
+        showPanel()
+    }
+
+    @objc private func toggleWidgetFromMenu() {
+        widgetController.toggleEnabled()
+    }
+
+    @objc private func selectLanguage(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let language = AppLanguage(rawValue: raw) else { return }
+        LanguageSettings.shared.language = language
+    }
+
+    @objc private func quitApp() {
+        NSApp.terminate(nil)
+    }
+
+    private func t(_ chinese: String, _ english: String) -> String {
+        LanguageSettings.shared.text(chinese, english)
+    }
+}
+
+/// 菜单栏面板的宿主视图
+private struct MenuPanelHostView: View {
+    let store: TaskStore
+    let widgetController: DesktopWidgetController
+
+    var body: some View {
+        TodoPanelView(widget: widgetController)
+            .environmentObject(store)
     }
 }
 
@@ -1162,26 +1427,6 @@ final class TaskStore: ObservableObject {
     }
 }
 
-struct MenuBarLabel: View {
-    let remainingCount: Int
-    @ObservedObject private var languageSettings = LanguageSettings.shared
-
-    var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: remainingCount == 0 ? "checkmark.circle.fill" : "checkmark.circle")
-            if remainingCount > 0 {
-                Text("\(remainingCount)")
-                    .monospacedDigit()
-            }
-        }
-        .accessibilityLabel(remainingCount == 0 ? t("TodoBar，所有任务已完成", "TodoBar, all tasks are complete") : t("TodoBar，剩余 \(remainingCount) 项任务", "TodoBar, \(remainingCount) tasks remaining"))
-    }
-
-    private func t(_ chinese: String, _ english: String) -> String {
-        languageSettings.text(chinese, english)
-    }
-}
-
 struct TodoPanelView: View {
     @EnvironmentObject private var taskStore: TaskStore
     @ObservedObject private var languageSettings = LanguageSettings.shared
@@ -1229,10 +1474,7 @@ struct TodoPanelView: View {
     var body: some View {
         panelContentView
             .frame(width: 360, height: 460)
-            .glassSurface(
-                cornerRadius: showsWidgetControls ? 22 : 10,
-                usesLiveBlur: showsWidgetControls
-            )
+            .glassSurface(cornerRadius: 22)
             .environment(\.locale, languageSettings.language.locale)
             .preferredColorScheme(nil)
             .onChange(of: panelContent) { newValue in
@@ -1367,23 +1609,6 @@ struct TodoPanelView: View {
             .help(t("桌面常驻小组件", "Pin to desktop"))
             .accessibilityLabel(t("桌面常驻小组件", "Pin to desktop"))
 
-            Menu {
-                Picker(t("语言", "Language"), selection: $languageSettings.language) {
-                    ForEach(AppLanguage.allCases) { language in
-                        Text(language.displayName).tag(language)
-                    }
-                }
-            } label: {
-                Text(languageSettings.language.shortName)
-                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 4)
-                    .background(Color.primary.opacity(0.06), in: Capsule())
-            }
-            .menuStyle(.borderlessButton)
-            .help(t("切换语言", "Switch language"))
-
             ProgressRing(progress: taskStore.progress, remainingCount: taskStore.remainingCount)
                 .accessibilityLabel(t("完成进度 \(Int(taskStore.progress * 100))%，剩余 \(taskStore.remainingCount) 项", "\(Int(taskStore.progress * 100))% complete, \(taskStore.remainingCount) remaining"))
         }
@@ -1394,28 +1619,26 @@ struct TodoPanelView: View {
             panelContent = .composer
         } label: {
             HStack(spacing: 10) {
-                Image(systemName: "plus")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(.teal)
-                    .frame(width: 24, height: 24)
-                    .background(Color.teal.opacity(0.12), in: Circle())
+                Image(systemName: "plus.circle.fill")
+                    .font(.system(size: 17, weight: .semibold))
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(t("新建待办", "New task"))
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.primary)
-                    Text(t("依次设置内容、优先级与日期", "Set content, priority, then date"))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
+                Text(t("新建待办", "New task"))
+                    .font(.system(size: 13, weight: .semibold))
 
+                Spacer()
+
+                Text(t("内容 · 优先级 · 日期", "Content · Priority · Date"))
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.78))
             }
-            .padding(10)
-            .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.03), lineWidth: 1)
-            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 13)
+            .padding(.vertical, 11)
+            .background(
+                LinearGradient(colors: [.teal, .mint], startPoint: .leading, endPoint: .trailing),
+                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+            )
+            .shadow(color: .teal.opacity(0.22), radius: 7, y: 3)
         }
         .buttonStyle(.plain)
         .accessibilityLabel(t("新建待办", "New task"))
@@ -1964,6 +2187,7 @@ struct TaskRow: View {
     let item: TodoItem
     let onEdit: () -> Void
     var compactCompletedStyle = false
+    @State private var isHovering = false
 
     private var dueDescription: (text: String, color: Color)? {
         guard let dueDate = item.dueDate else { return nil }
@@ -2045,7 +2269,14 @@ struct TaskRow: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, compactCompletedStyle ? 7 : 8)
-        .background(item.isCompleted ? Color.primary.opacity(0.02) : Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .background(
+            item.isCompleted
+                ? Color.primary.opacity(0.02)
+                : (isHovering ? Color.primary.opacity(0.09) : Color.primary.opacity(0.04)),
+            in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+        )
+        .animation(.easeInOut(duration: 0.15), value: isHovering)
+        .onHover { isHovering = $0 }
         .overlay {
             RoundedRectangle(cornerRadius: 11, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.03), lineWidth: 1)

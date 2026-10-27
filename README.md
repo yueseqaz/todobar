@@ -14,7 +14,7 @@ A lightweight native macOS menu bar to-do app for capturing work before it slips
 | Global quick capture | Press `Option + Command + T` from any app to capture a task. |
 | Evening desktop reminder | At 9 PM, TodoBar shows its own floating desktop window for unfinished tasks due today. |
 | Date-aware groups | See **Overdue**, **Due today**, and **Upcoming** tasks separately. |
-| Bilingual UI | Switch between Simplified Chinese and English from the language control in the menu-bar panel. |
+| Bilingual UI | Right-click the menu-bar icon → Settings → Language to switch between Simplified Chinese and English; the right-click menu also opens the panel, toggles the desktop widget, and quits. |
 | Local-first data | Tasks are stored locally in your Application Support directory. |
 
 ## Requirements
