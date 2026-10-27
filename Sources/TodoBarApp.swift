@@ -128,11 +128,9 @@ extension View {
 
 // MARK: - 桌面常驻小组件
 
-enum ScreenCorner {
-    case topLeft
-    case topRight
-    case bottomLeft
-    case bottomRight
+enum WidgetSide {
+    case left
+    case right
 }
 
 /// 无边框、不抢焦点的玻璃面板；App 未激活时也能成为 key，面板内可以直接输入文字
@@ -199,8 +197,8 @@ final class DesktopWidgetController: NSObject, ObservableObject {
         panel?.makeKeyAndOrderFront(nil)
     }
 
-    /// 菜单栏唤起：已收纳则先展开，并确保面板可见
-    func revealFromStatusBar() {
+    /// 菜单栏「打开面板」：始终展开并显示
+    func expandFromStatusBar() {
         guard isEnabled else { return }
         if panel == nil {
             showPanel()
@@ -211,12 +209,22 @@ final class DesktopWidgetController: NSObject, ObservableObject {
         panel?.orderFrontRegardless()
     }
 
-    func snap(to corner: ScreenCorner) {
+    /// 菜单栏左键点按：展开 ⇄ 收纳成小图标
+    func toggleFromStatusBar() {
+        guard isEnabled else { return }
+        if let panel, panel.isVisible, isExpanded {
+            setExpanded(false)
+        } else {
+            expandFromStatusBar()
+        }
+    }
+
+    func snap(to side: WidgetSide) {
         guard let panel else { return }
         let visible = screenHosting(panel.frame)?.visibleFrame
             ?? NSScreen.main?.visibleFrame
             ?? panel.frame
-        let target = Self.frame(size: panel.frame.size, anchoredTo: corner, in: visible)
+        let target = Self.frame(size: panel.frame.size, side: side, y: panel.frame.origin.y, in: visible)
         panel.setFrame(target, display: true, animate: true)
         panel.invalidateShadow()
         persistFrame()
@@ -233,6 +241,12 @@ final class DesktopWidgetController: NSObject, ObservableObject {
 
     func finishDragging() {
         guard let panel else { return }
+        // 悬浮窗只贴靠屏幕左右两侧：松手时水平方向吸附到较近的一边
+        let visible = screenHosting(panel.frame)?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? panel.frame
+        let side = Self.nearestSide(of: panel.frame, in: visible)
+        panel.setFrame(Self.frame(size: panel.frame.size, side: side, y: panel.frame.origin.y, in: visible), display: false)
         panel.invalidateShadow()
         persistFrame()
     }
@@ -281,7 +295,7 @@ final class DesktopWidgetController: NSObject, ObservableObject {
         return panel
     }
 
-    /// 展开与收纳共用：把面板切到目标尺寸，并锚定到当前位置最近的屏幕角落
+    /// 展开与收纳共用：把面板切到目标尺寸，水平贴靠当前一侧，顶部边缘保持不动
     private func resizePanel(animated: Bool) {
         guard let panel else { return }
         let size = isExpanded ? Self.expandedSize : Self.collapsedSize
@@ -289,18 +303,22 @@ final class DesktopWidgetController: NSObject, ObservableObject {
             ?? NSScreen.main?.visibleFrame
             ?? NSRect(origin: .zero, size: size)
 
-        let corner: ScreenCorner
+        let side: WidgetSide
+        let y: CGFloat
         if panel.frame.width < 1 || panel.frame.height < 1 {
             if let saved = savedFrame(), visible.intersects(saved) {
-                corner = Self.nearestCorner(of: saved, in: visible)
+                side = Self.nearestSide(of: saved, in: visible)
+                y = saved.origin.y
             } else {
-                corner = .topRight
+                side = .right
+                y = visible.maxY - 14 - size.height
             }
         } else {
-            corner = Self.nearestCorner(of: panel.frame, in: visible)
+            side = Self.nearestSide(of: panel.frame, in: visible)
+            y = panel.frame.maxY - size.height
         }
 
-        panel.setFrame(Self.frame(size: size, anchoredTo: corner, in: visible), display: true, animate: animated)
+        panel.setFrame(Self.frame(size: size, side: side, y: y, in: visible), display: true, animate: animated)
         panel.invalidateShadow()
         persistFrame()
     }
@@ -329,30 +347,14 @@ final class DesktopWidgetController: NSObject, ObservableObject {
         return clamped
     }
 
-    static func nearestCorner(of frame: NSRect, in visible: NSRect) -> ScreenCorner {
-        let center = CGPoint(x: frame.midX, y: frame.midY)
-        let candidates: [(ScreenCorner, CGFloat)] = [
-            (.topLeft, hypot(center.x - visible.minX, center.y - visible.maxY)),
-            (.topRight, hypot(center.x - visible.maxX, center.y - visible.maxY)),
-            (.bottomLeft, hypot(center.x - visible.minX, center.y - visible.minY)),
-            (.bottomRight, hypot(center.x - visible.maxX, center.y - visible.minY))
-        ]
-        return candidates.min { $0.1 < $1.1 }?.0 ?? .topRight
+    static func nearestSide(of frame: NSRect, in visible: NSRect) -> WidgetSide {
+        frame.midX < visible.midX ? .left : .right
     }
 
-    static func frame(size: NSSize, anchoredTo corner: ScreenCorner, in visible: NSRect, margin: CGFloat = 14) -> NSRect {
-        let origin: CGPoint
-        switch corner {
-        case .topLeft:
-            origin = CGPoint(x: visible.minX + margin, y: visible.maxY - margin - size.height)
-        case .topRight:
-            origin = CGPoint(x: visible.maxX - margin - size.width, y: visible.maxY - margin - size.height)
-        case .bottomLeft:
-            origin = CGPoint(x: visible.minX + margin, y: visible.minY + margin)
-        case .bottomRight:
-            origin = CGPoint(x: visible.maxX - margin - size.width, y: visible.minY + margin)
-        }
-        return NSRect(origin: origin, size: size)
+    static func frame(size: NSSize, side: WidgetSide, y: CGFloat, in visible: NSRect, margin: CGFloat = 14) -> NSRect {
+        let x = side == .left ? visible.minX + margin : visible.maxX - margin - size.width
+        let clampedY = min(max(y, visible.minY + margin), visible.maxY - margin - size.height)
+        return NSRect(origin: CGPoint(x: x, y: clampedY), size: size)
     }
 }
 
@@ -403,12 +405,8 @@ struct DesktopWidgetRootView: View {
 
         Divider()
 
-        Menu(t("对齐到屏幕角落", "Snap to corner")) {
-            Button(t("左上角", "Top left")) { controller.snap(to: .topLeft) }
-            Button(t("右上角", "Top right")) { controller.snap(to: .topRight) }
-            Button(t("左下角", "Bottom left")) { controller.snap(to: .bottomLeft) }
-            Button(t("右下角", "Bottom right")) { controller.snap(to: .bottomRight) }
-        }
+        Button(t("贴靠到屏幕左侧", "Snap to left edge")) { controller.snap(to: .left) }
+        Button(t("贴靠到屏幕右侧", "Snap to right edge")) { controller.snap(to: .right) }
 
         Divider()
 
@@ -541,6 +539,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     private var statusItem: NSStatusItem?
     private var panel: WidgetPanel?
+    private var aboutPanel: WidgetPanel?
     private var eventMonitors: [Any] = []
     private var iconSubscription: AnyCancellable?
     private var widgetSubscription: AnyCancellable?
@@ -599,10 +598,19 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    /// 小组件开启时直接唤起小组件，避免出现两个待办面板
+    /// 左键：小组件开启时 展开⇄收纳，否则开合菜单面板
     private func openPanelAction() {
         if widgetController.isEnabled {
-            widgetController.revealFromStatusBar()
+            widgetController.toggleFromStatusBar()
+        } else {
+            togglePanel()
+        }
+    }
+
+    /// 右键「打开待办面板」：始终展开显示，避免出现两个待办面板
+    private func revealPanelAction() {
+        if widgetController.isEnabled {
+            widgetController.expandFromStatusBar()
         } else {
             showPanel()
         }
@@ -657,9 +665,31 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         return panel
     }
 
+    private func makeAboutPanel() -> WidgetPanel {
+        let panel = WidgetPanel(
+            contentRect: NSRect(origin: .zero, size: NSSize(width: 280, height: 244)),
+            styleMask: [.borderless, .nonactivatingPanel, .utilityWindow],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.level = .floating
+        panel.collectionBehavior = [.fullScreenAuxiliary]
+        panel.isReleasedWhenClosed = false
+
+        let hosting = NSHostingView(rootView: AboutView(onClose: { [weak panel] in
+            panel?.orderOut(nil)
+        }))
+        hosting.autoresizingMask = [.width, .height]
+        panel.contentView = hosting
+        return panel
+    }
+
     /// 把面板放到状态图标正下方，越界时往屏幕内收
-    private func positionPanel(_ panel: NSPanel) {
-        guard let button = statusItem?.button, let itemWindow = button.window else {
+    private func positionPanel(_ panel: NSPanel) {        guard let button = statusItem?.button, let itemWindow = button.window else {
             panel.center()
             return
         }
@@ -676,7 +706,13 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     private func hidePanel() {
         panel?.orderOut(nil)
-        removeMonitors()
+        removeMonitorsIfIdle()
+    }
+
+    private func removeMonitorsIfIdle() {
+        if panel?.isVisible != true && aboutPanel?.isVisible != true {
+            removeMonitors()
+        }
     }
 
     private func installMonitorsIfNeeded() {
@@ -699,15 +735,19 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     private func hidePanelIfClickedOutside() {
-        guard let panel, panel.isVisible else { return }
+        guard panel?.isVisible == true || aboutPanel?.isVisible == true else { return }
         let mouse = NSEvent.mouseLocation
-        if panel.frame.contains(mouse) { return }
-        // 点击状态图标本身时交给 toggle 处理，避免“关了又开”
-        if let button = statusItem?.button, let window = button.window,
-           window.convertToScreen(button.bounds).contains(mouse) {
-            return
+        var itemFrame: NSRect?
+        if let button = statusItem?.button, let window = button.window {
+            itemFrame = window.convertToScreen(button.bounds)
         }
-        hidePanel()
+
+        for visiblePanel in [panel, aboutPanel].compactMap({ $0 }) where visiblePanel.isVisible {
+            if visiblePanel.frame.contains(mouse) { continue }
+            if let itemFrame, itemFrame.contains(mouse) { continue }
+            visiblePanel.orderOut(nil)
+        }
+        removeMonitorsIfIdle()
     }
 
     // MARK: 右键菜单
@@ -762,6 +802,16 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
         contextMenu.addItem(.separator())
 
+        let aboutItem = NSMenuItem(
+            title: t("关于 TodoBar", "About TodoBar"),
+            action: #selector(showAbout),
+            keyEquivalent: ""
+        )
+        aboutItem.target = self
+        contextMenu.addItem(aboutItem)
+
+        contextMenu.addItem(.separator())
+
         let quitItem = NSMenuItem(
             title: t("退出 TodoBar", "Quit TodoBar"),
             action: #selector(quitApp),
@@ -772,7 +822,20 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func openPanelFromMenu() {
-        openPanelAction()
+        revealPanelAction()
+    }
+
+    @objc private func showAbout() {
+        let panel = self.aboutPanel ?? makeAboutPanel()
+        self.aboutPanel = panel
+        if panel.isVisible {
+            panel.orderOut(nil)
+            removeMonitorsIfIdle()
+            return
+        }
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+        installMonitorsIfNeeded()
     }
 
     @objc private func toggleWidgetFromMenu() {
@@ -802,6 +865,78 @@ private struct MenuPanelHostView: View {
     var body: some View {
         TodoPanelView(widget: widgetController)
             .environmentObject(store)
+    }
+}
+
+/// 关于窗口：应用信息 + 可点击跳转的仓库链接
+struct AboutView: View {
+    let onClose: () -> Void
+    @ObservedObject private var languageSettings = LanguageSettings.shared
+
+    private var version: String {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "1.0.0"
+    }
+
+    private var repoURL: URL {
+        URL(string: "https://github.com/yueseqaz/todobar")!
+    }
+
+    var body: some View {
+        VStack(spacing: 13) {
+            HStack {
+                Spacer()
+                Button {
+                    onClose()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 15))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help(t("关闭", "Close"))
+            }
+
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 62, height: 62)
+                .shadow(color: .black.opacity(0.18), radius: 7, y: 3)
+
+            VStack(spacing: 3) {
+                Text("TodoBar")
+                    .font(.system(size: 18, weight: .bold, design: .rounded))
+                Text(t("版本 \(version) · 本地优先的菜单栏待办", "Version \(version) · Local-first menu bar todos"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Button {
+                NSWorkspace.shared.open(repoURL)
+            } label: {
+                Label(t("GitHub 仓库", "GitHub repository"), systemImage: "safari")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.blue)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(Color.blue.opacity(0.13), in: Capsule())
+                    .overlay {
+                        Capsule().strokeBorder(Color.blue.opacity(0.35), lineWidth: 1)
+                    }
+            }
+            .buttonStyle(.plain)
+            .help(repoURL.absoluteString)
+
+            Text(t("任务仅保存在本机 · ⌥⌘T 快速收集", "Tasks stay on this Mac · ⌥⌘T quick capture"))
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(18)
+        .frame(width: 280, height: 244)
+        .glassSurface(cornerRadius: 20)
+    }
+
+    private func t(_ chinese: String, _ english: String) -> String {
+        languageSettings.text(chinese, english)
     }
 }
 
@@ -1378,6 +1513,30 @@ final class TaskStore: ObservableObject {
         return Double(tasks.filter(\.isCompleted).count) / Double(tasks.count)
     }
 
+    /// 今天已完成：completedAt 在今天的任务
+    var completedTodayCount: Int {
+        let calendar = Calendar.current
+        return tasks.filter { item in
+            guard item.isCompleted, let completedAt = item.completedAt else { return false }
+            return calendar.isDateInToday(completedAt)
+        }.count
+    }
+
+    /// 今天待完成：到期日是今天或未安排日期的未完成任务（与面板“当天待完成”分组一致）
+    var todayOpenCount: Int {
+        let calendar = Calendar.current
+        return tasks.filter { item in
+            guard !item.isCompleted else { return false }
+            guard let dueDate = item.dueDate else { return true }
+            return calendar.isDateInToday(dueDate)
+        }.count
+    }
+
+    /// 今日进度基数 = 今天已完成 + 今天待完成
+    var todayScopeTotal: Int {
+        completedTodayCount + todayOpenCount
+    }
+
     func add(title: String, priority: TaskPriority, dueDate: Date?) {
         let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedTitle.isEmpty else { return }
@@ -1651,8 +1810,8 @@ struct TodoPanelView: View {
             .help(t("桌面常驻小组件", "Pin to desktop"))
             .accessibilityLabel(t("桌面常驻小组件", "Pin to desktop"))
 
-            ProgressRing(progress: taskStore.progress, remainingCount: taskStore.remainingCount)
-                .accessibilityLabel(t("完成进度 \(Int(taskStore.progress * 100))%，剩余 \(taskStore.remainingCount) 项", "\(Int(taskStore.progress * 100))% complete, \(taskStore.remainingCount) remaining"))
+            TodayProgressBadge(done: taskStore.completedTodayCount, total: taskStore.todayScopeTotal)
+                .help(t("今天的完成进度", "Today's completion progress"))
         }
     }
 
@@ -2449,28 +2608,36 @@ struct TaskRow: View {
     }
 }
 
-struct ProgressRing: View {
-    let progress: Double
-    let remainingCount: Int
+struct TodayProgressBadge: View {
+    let done: Int
+    let total: Int
+    @ObservedObject private var languageSettings = LanguageSettings.shared
+
+    private var progress: Double {
+        total == 0 ? 0 : Double(done) / Double(total)
+    }
 
     var body: some View {
-        ZStack {
-            Circle()
-                .stroke(Color.primary.opacity(0.08), style: StrokeStyle(lineWidth: 4))
+        VStack(alignment: .trailing, spacing: 4) {
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.primary.opacity(0.1))
+                Capsule()
+                    .fill(LinearGradient(colors: [.blue, .cyan], startPoint: .leading, endPoint: .trailing))
+                    .frame(width: total == 0 ? 0 : max(5, 56 * progress))
+            }
+            .frame(width: 56, height: 5)
 
-            Circle()
-                .trim(from: 0, to: max(0.04, progress))
-                .stroke(
-                    LinearGradient(colors: [.cyan, .blue], startPoint: .topLeading, endPoint: .bottomTrailing),
-                    style: StrokeStyle(lineWidth: 4, lineCap: .round)
-                )
-                .rotationEffect(.degrees(-90))
-                .animation(.snappy(duration: 0.35), value: progress)
-
-            Text(remainingCount == 0 ? "✓" : "\(remainingCount)")
-                .font(.system(size: 11, weight: .bold, design: .rounded))
-                .foregroundStyle(remainingCount == 0 ? Color.blue : Color.primary)
+            Text("\(done)/\(total)")
+                .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
         }
-        .frame(width: 36, height: 36)
+        .animation(.snappy(duration: 0.3), value: progress)
+        .accessibilityLabel(t("今天完成 \(done) / \(total) 项", "Completed \(done) of \(total) today"))
+    }
+
+    private func t(_ chinese: String, _ english: String) -> String {
+        languageSettings.text(chinese, english)
     }
 }
