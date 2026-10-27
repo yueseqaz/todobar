@@ -199,6 +199,18 @@ final class DesktopWidgetController: NSObject, ObservableObject {
         panel?.makeKeyAndOrderFront(nil)
     }
 
+    /// 菜单栏唤起：已收纳则先展开，并确保面板可见
+    func revealFromStatusBar() {
+        guard isEnabled else { return }
+        if panel == nil {
+            showPanel()
+        }
+        if !isExpanded {
+            setExpanded(true)
+        }
+        panel?.orderFrontRegardless()
+    }
+
     func snap(to corner: ScreenCorner) {
         guard let panel else { return }
         let visible = screenHosting(panel.frame)?.visibleFrame
@@ -438,14 +450,14 @@ struct WidgetCollapsedBadge: View {
                 Image(systemName: "checkmark")
                     .font(.system(size: 20, weight: .bold))
                     .foregroundStyle(
-                        LinearGradient(colors: [.mint, .teal], startPoint: .topLeading, endPoint: .bottomTrailing)
+                        LinearGradient(colors: [.cyan, .blue], startPoint: .topLeading, endPoint: .bottomTrailing)
                     )
             } else {
                 VStack(spacing: 1) {
                     Image(systemName: "checklist")
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(
-                            LinearGradient(colors: [.mint, .teal], startPoint: .topLeading, endPoint: .bottomTrailing)
+                            LinearGradient(colors: [.cyan, .blue], startPoint: .topLeading, endPoint: .bottomTrailing)
                         )
                     Text("\(taskStore.remainingCount)")
                         .font(.system(size: 10, weight: .bold, design: .rounded))
@@ -481,18 +493,16 @@ struct WidgetCollapsedBadge: View {
 }
 
 @main
-struct TodoBarApp: App {
-    @NSApplicationDelegateAdaptor private var appDelegate: AppDelegate
-
-    var body: some Scene {
-        // 所有窗口由 AppKit 直接管理（状态栏图标 + 面板 + 桌面小组件），这里仅保留占位 Scene
-        Settings { EmptyView() }
-    }
-}
-
-@MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class TodoBarMain: NSObject, NSApplicationDelegate {
     private var model: TodoBarModel?
+
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = TodoBarMain()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        app.run()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let model = TodoBarModel()
@@ -533,6 +543,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private var panel: WidgetPanel?
     private var eventMonitors: [Any] = []
     private var iconSubscription: AnyCancellable?
+    private var widgetSubscription: AnyCancellable?
     private let contextMenu = NSMenu()
     private var isShowingContextMenu = false
 
@@ -560,6 +571,13 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             let remaining = tasks.lazy.filter { !$0.isCompleted }.count
             self?.updateIcon(remaining: remaining)
         }
+
+        // 小组件开启时收起菜单面板，避免出现两个待办面板
+        widgetSubscription = widgetController.$isEnabled.receive(on: DispatchQueue.main).sink { [weak self] enabled in
+            if enabled {
+                self?.hidePanel()
+            }
+        }
     }
 
     private func updateIcon(remaining: Int) {
@@ -577,7 +595,16 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         if NSApp.currentEvent?.type == .rightMouseUp {
             showContextMenu()
         } else {
-            togglePanel()
+            openPanelAction()
+        }
+    }
+
+    /// 小组件开启时直接唤起小组件，避免出现两个待办面板
+    private func openPanelAction() {
+        if widgetController.isEnabled {
+            widgetController.revealFromStatusBar()
+        } else {
+            showPanel()
         }
     }
 
@@ -745,7 +772,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func openPanelFromMenu() {
-        showPanel()
+        openPanelAction()
     }
 
     @objc private func toggleWidgetFromMenu() {
@@ -940,7 +967,7 @@ struct QuickCaptureView: View {
             HStack {
                 Label(t("快速收集", "Quick capture"), systemImage: "text.badge.plus")
                     .font(.system(size: 14, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.teal)
+                    .foregroundStyle(.blue)
                 Spacer()
                 Text("⌥⌘T")
                     .font(.caption.monospaced())
@@ -962,7 +989,7 @@ struct QuickCaptureView: View {
                     .buttonStyle(.bordered)
                 Button(t("加入待办", "Add task")) { save() }
                     .buttonStyle(.borderedProminent)
-                    .tint(.teal)
+                    .tint(.blue)
                     .disabled(!isValid)
                     .keyboardShortcut(.defaultAction)
             }
@@ -1268,11 +1295,26 @@ enum TaskPriority: String, CaseIterable, Codable, Identifiable {
         language == .english ? "\(title(in: language)) priority" : "\(title)优先级"
     }
 
+    func subtitle(in language: AppLanguage) -> String {
+        guard language == .english else {
+            switch self {
+            case .high: return "尽快处理"
+            case .medium: return "正常安排"
+            case .low: return "有空再做"
+            }
+        }
+        switch self {
+        case .high: return "Handle soon"
+        case .medium: return "Normal pace"
+        case .low: return "When you're free"
+        }
+    }
+
     var color: Color {
         switch self {
         case .high: return .red
         case .medium: return .orange
-        case .low: return .teal
+        case .low: return .blue
         }
     }
 
@@ -1558,13 +1600,13 @@ struct TodoPanelView: View {
                 Circle()
                     .fill(
                         LinearGradient(
-                            colors: [.mint, .teal],
+                            colors: [.cyan, .blue],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )
                     )
                     .frame(width: 36, height: 36)
-                    .shadow(color: .teal.opacity(0.16), radius: 4, y: 2)
+                    .shadow(color: .blue.opacity(0.16), radius: 4, y: 2)
 
                 Image(systemName: taskStore.remainingCount == 0 ? "checkmark" : "checklist")
                     .font(.system(size: 15, weight: .bold))
@@ -1601,9 +1643,9 @@ struct TodoPanelView: View {
             } label: {
                 Image(systemName: widget.isEnabled ? "pin.fill" : "pin")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(widget.isEnabled ? Color.teal : Color.secondary)
+                    .foregroundStyle(widget.isEnabled ? Color.blue : Color.secondary)
                     .frame(width: 22, height: 22)
-                    .background(widget.isEnabled ? Color.teal.opacity(0.14) : Color.primary.opacity(0.05), in: Circle())
+                    .background(widget.isEnabled ? Color.blue.opacity(0.14) : Color.primary.opacity(0.05), in: Circle())
             }
             .buttonStyle(.plain)
             .help(t("桌面常驻小组件", "Pin to desktop"))
@@ -1635,10 +1677,10 @@ struct TodoPanelView: View {
             .padding(.horizontal, 13)
             .padding(.vertical, 11)
             .background(
-                LinearGradient(colors: [.teal, .mint], startPoint: .leading, endPoint: .trailing),
+                LinearGradient(colors: [.blue, .cyan], startPoint: .leading, endPoint: .trailing),
                 in: RoundedRectangle(cornerRadius: 12, style: .continuous)
             )
-            .shadow(color: .teal.opacity(0.22), radius: 7, y: 3)
+            .shadow(color: .blue.opacity(0.22), radius: 7, y: 3)
         }
         .buttonStyle(.plain)
         .accessibilityLabel(t("新建待办", "New task"))
@@ -1764,7 +1806,7 @@ struct TaskComposerSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: 16) {
             HStack {
                 Button(t("取消", "Cancel")) { onCancel() }
                     .buttonStyle(.plain)
@@ -1802,7 +1844,7 @@ struct TaskComposerSheet: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(.teal)
+                .tint(.blue)
                 .disabled(step == 1 && !isTitleValid)
                 .keyboardShortcut(.defaultAction)
             }
@@ -1819,11 +1861,20 @@ struct TaskComposerSheet: View {
         HStack(spacing: 0) {
             ForEach(1...3, id: \.self) { number in
                 HStack(spacing: 6) {
-                    Text("\(number)")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(number <= step ? .white : .secondary)
-                        .frame(width: 18, height: 18)
-                        .background(number <= step ? Color.teal : Color.primary.opacity(0.08), in: Circle())
+                    ZStack {
+                        Circle()
+                            .fill(number <= step ? Color.blue : Color.primary.opacity(0.08))
+                            .frame(width: 20, height: 20)
+                        if number < step {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 9, weight: .black))
+                                .foregroundStyle(.white)
+                        } else {
+                            Text("\(number)")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(number == step ? .white : .secondary)
+                        }
+                    }
                     Text(stepName(number))
                         .font(.caption.weight(number == step ? .semibold : .regular))
                         .foregroundStyle(number == step ? .primary : .secondary)
@@ -1831,8 +1882,8 @@ struct TaskComposerSheet: View {
 
                 if number < 3 {
                     Rectangle()
-                        .fill(number < step ? Color.teal.opacity(0.55) : Color.primary.opacity(0.1))
-                        .frame(height: 1)
+                        .fill(number < step ? Color.blue.opacity(0.5) : Color.primary.opacity(0.1))
+                        .frame(height: 1.5)
                         .padding(.horizontal, 8)
                 }
             }
@@ -1842,77 +1893,187 @@ struct TaskComposerSheet: View {
     @ViewBuilder
     private var stepContent: some View {
         switch step {
-        case 1:
-            VStack(alignment: .leading, spacing: 10) {
-                Text(t("写下要做的事", "Write down the task"))
-                    .font(.system(size: 20, weight: .bold, design: .rounded))
-                Text(t("保持简短、具体，下一步再安排细节。", "Keep it short and specific; arrange details next."))
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                TextField(t("例如：整理项目周报", "e.g. Prepare the project update"), text: $title)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 15))
-                    .focused($titleIsFocused)
-                    .onSubmit {
-                        if isTitleValid { step = 2 }
-                    }
-                    .padding(.top, 4)
+        case 1: titleStep
+        case 2: priorityStep
+        default: dateStep
+        }
+    }
+
+    private func stepHeader(_ icon: String, _ title: String, _ subtitle: String) -> some View {
+        HStack(spacing: 11) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(LinearGradient(colors: [.blue, .cyan], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .frame(width: 34, height: 34)
+                    .shadow(color: .blue.opacity(0.25), radius: 5, y: 2)
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
             }
-            .frame(minHeight: 118, alignment: .top)
-        case 2:
-            VStack(alignment: .leading, spacing: 10) {
-                Text(t("选择优先级", "Choose priority"))
-                    .font(.system(size: 20, weight: .bold, design: .rounded))
-                Text(t("优先级用于帮你安排任务顺序。", "Priority helps you arrange the task order."))
-                    .font(.subheadline)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 16, weight: .bold, design: .rounded))
+                Text(subtitle)
+                    .font(.caption)
                     .foregroundStyle(.secondary)
-                HStack(spacing: 8) {
-                    ForEach(TaskPriority.allCases) { option in
-                        Button {
-                            priority = option
-                        } label: {
-                            VStack(spacing: 7) {
+            }
+        }
+    }
+
+    private var titleStep: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            stepHeader(
+                "pencil.line",
+                t("写下要做的事", "Write down the task"),
+                t("保持简短、具体，下一步再安排细节。", "Keep it short and specific; arrange details next.")
+            )
+            TextField(t("例如：整理项目周报", "e.g. Prepare the project update"), text: $title)
+                .textFieldStyle(.plain)
+                .font(.system(size: 15, weight: .medium))
+                .focused($titleIsFocused)
+                .onSubmit {
+                    if isTitleValid { step = 2 }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 11)
+                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .strokeBorder(titleIsFocused ? Color.blue.opacity(0.55) : Color.primary.opacity(0.05), lineWidth: 1.5)
+                }
+            HStack(spacing: 5) {
+                Image(systemName: "return")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.secondary)
+                Text(t("按回车进入下一步", "Press return to continue"))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(14)
+        .frame(minHeight: 156, alignment: .top)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.04), lineWidth: 1)
+        }
+    }
+
+    private var priorityStep: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            stepHeader(
+                "flag.fill",
+                t("选择优先级", "Choose priority"),
+                t("优先级帮你安排处理顺序。", "Priority arranges the order you handle things.")
+            )
+            VStack(spacing: 8) {
+                ForEach(TaskPriority.allCases) { option in
+                    Button {
+                        withAnimation(.snappy(duration: 0.18)) { priority = option }
+                    } label: {
+                        HStack(spacing: 10) {
+                            ZStack {
                                 Circle()
-                                    .fill(option.color)
-                                    .frame(width: 10, height: 10)
-                                Text(option.priorityLabel(in: languageSettings.language))
-                                    .font(.caption.weight(.semibold))
+                                    .fill(priority == option ? option.color : option.color.opacity(0.15))
+                                    .frame(width: 26, height: 26)
+                                Image(systemName: option.symbol)
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundStyle(priority == option ? .white : option.color)
                             }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 11)
-                            .background(priority == option ? option.color.opacity(0.14) : Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .strokeBorder(priority == option ? option.color.opacity(0.55) : Color.primary.opacity(0.04), lineWidth: 1)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(option.priorityLabel(in: languageSettings.language))
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                                Text(option.subtitle(in: languageSettings.language))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if priority == option {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 14))
+                                    .foregroundStyle(option.color)
                             }
                         }
-                        .buttonStyle(.plain)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 8)
+                        .background(
+                            priority == option ? option.color.opacity(0.12) : Color.primary.opacity(0.04),
+                            in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        )
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                .strokeBorder(priority == option ? option.color.opacity(0.5) : Color.primary.opacity(0.04), lineWidth: 1)
+                        }
+                        .contentShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
                     }
+                    .buttonStyle(.plain)
                 }
-                .padding(.top, 4)
             }
-            .frame(minHeight: 118, alignment: .top)
-        default:
-            VStack(alignment: .leading, spacing: 10) {
-                Text(t("选择日期", "Choose date"))
-                    .font(.system(size: 20, weight: .bold, design: .rounded))
-                Text(t("默认安排在今天；需要时再调整日期。", "It defaults to today; adjust only when needed."))
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                HStack(spacing: 10) {
-                    dateWheelPicker(title: t("月", "Month"), selection: $selectedMonth, values: Array(1...12), suffix: languageSettings.language == .english ? "" : "月")
-                    dateWheelPicker(title: t("日", "Day"), selection: $selectedDay, values: Array(1...daysInSelectedMonth), suffix: languageSettings.language == .english ? "" : "日")
-                }
-                .frame(height: 122)
-                .padding(.top, 5)
-
-                Text(t("已选择 \(selectedMonth) 月 \(selectedDay) 日", "Selected: \(selectedMonth)/\(selectedDay)"))
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.teal)
-                    .padding(.top, 2)
-            }
-            .frame(minHeight: 270, alignment: .top)
         }
+        .padding(14)
+        .frame(minHeight: 210, alignment: .top)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.04), lineWidth: 1)
+        }
+    }
+
+    private var dateStep: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            stepHeader(
+                "calendar",
+                t("选择日期", "Choose date"),
+                t("默认安排在今天，需要时再调整。", "Defaults to today; adjust only when needed.")
+            )
+            HStack(spacing: 8) {
+                quickDateChip(days: 0, label: t("今天", "Today"))
+                quickDateChip(days: 1, label: t("明天", "Tomorrow"))
+                quickDateChip(days: 2, label: t("后天", "In 2 days"))
+                Spacer()
+            }
+            HStack(spacing: 10) {
+                dateWheelPicker(title: t("月", "Month"), selection: $selectedMonth, values: Array(1...12), suffix: languageSettings.language == .english ? "" : "月")
+                dateWheelPicker(title: t("日", "Day"), selection: $selectedDay, values: Array(1...daysInSelectedMonth), suffix: languageSettings.language == .english ? "" : "日")
+            }
+            .frame(height: 112)
+
+            Label(t("已选择 \(selectedMonth) 月 \(selectedDay) 日", "Selected: \(selectedMonth)/\(selectedDay)"), systemImage: "calendar.badge.checkmark")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.blue)
+        }
+        .padding(14)
+        .frame(minHeight: 252, alignment: .top)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.04), lineWidth: 1)
+        }
+    }
+
+    private func quickDateChip(days: Int, label: String) -> some View {
+        let calendar = Calendar.current
+        let target = calendar.startOfDay(for: calendar.date(byAdding: .day, value: days, to: Date()) ?? Date())
+        let isSelected = calendar.isDate(selectedDueDate, inSameDayAs: target)
+        return Button {
+            selectedMonth = calendar.component(.month, from: target)
+            selectedDay = calendar.component(.day, from: target)
+        } label: {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .foregroundStyle(isSelected ? Color.blue : Color.secondary)
+                .background(isSelected ? Color.blue.opacity(0.14) : Color.primary.opacity(0.05), in: Capsule())
+                .overlay {
+                    Capsule().strokeBorder(isSelected ? Color.blue.opacity(0.45) : Color.clear, lineWidth: 1)
+                }
+        }
+        .buttonStyle(.plain)
     }
 
     private func dateWheelPicker(title: String, selection: Binding<Int>, values: [Int], suffix: String) -> some View {
@@ -2166,7 +2327,7 @@ struct TaskEditorSheet: View {
                     onCancel()
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(.teal)
+                .tint(.blue)
                 .disabled(!canSave)
                 .keyboardShortcut(.defaultAction)
             }
@@ -2215,10 +2376,10 @@ struct TaskRow: View {
             } label: {
                 ZStack {
                     Circle()
-                        .fill(item.isCompleted ? Color.teal : Color.clear)
+                        .fill(item.isCompleted ? Color.blue : Color.clear)
                         .overlay {
                             Circle()
-                                .strokeBorder(item.isCompleted ? Color.teal : Color.primary.opacity(0.32), lineWidth: 1.5)
+                                .strokeBorder(item.isCompleted ? Color.blue : Color.primary.opacity(0.32), lineWidth: 1.5)
                         }
 
                     if item.isCompleted {
@@ -2300,7 +2461,7 @@ struct ProgressRing: View {
             Circle()
                 .trim(from: 0, to: max(0.04, progress))
                 .stroke(
-                    LinearGradient(colors: [.mint, .teal], startPoint: .topLeading, endPoint: .bottomTrailing),
+                    LinearGradient(colors: [.cyan, .blue], startPoint: .topLeading, endPoint: .bottomTrailing),
                     style: StrokeStyle(lineWidth: 4, lineCap: .round)
                 )
                 .rotationEffect(.degrees(-90))
@@ -2308,7 +2469,7 @@ struct ProgressRing: View {
 
             Text(remainingCount == 0 ? "✓" : "\(remainingCount)")
                 .font(.system(size: 11, weight: .bold, design: .rounded))
-                .foregroundStyle(remainingCount == 0 ? Color.teal : Color.primary)
+                .foregroundStyle(remainingCount == 0 ? Color.blue : Color.primary)
         }
         .frame(width: 36, height: 36)
     }
