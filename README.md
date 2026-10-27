@@ -9,6 +9,7 @@ A lightweight native macOS menu bar to-do app for capturing work before it slips
 | Capability | Details |
 | --- | --- |
 | Menu bar workflow | Keep the task list one click away without a Dock window. |
+| Glass desktop widget | Pin the panel anywhere on the desktop from the menu-bar panel: real-time acrylic blur, draggable, right-click to snap to any screen corner. Tap the collapse button to shrink it into a small glass icon; tap the icon to bring it back. |
 | Three-step creation | Create a task in order: content, priority, then date. |
 | Global quick capture | Press `Option + Command + T` from any app to capture a task. |
 | Evening desktop reminder | At 9 PM, TodoBar shows its own floating desktop window for unfinished tasks due today. |
@@ -29,6 +30,8 @@ open dist/TodoBar.app
 ```
 
 The built application is placed at `dist/TodoBar.app`.
+
+> Note: if the build fails with `plugin for module 'SwiftUIMacros' not found`, your Command Line Tools is missing the SwiftUI macro plugin (a known issue in some CLT versions). Install full Xcode, or extract a standalone [swift.org toolchain](https://www.swift.org/install/macos/) into `~/Library/Developer/Toolchains/` — `build.sh` automatically prefers it.
 
 ## Install safely
 

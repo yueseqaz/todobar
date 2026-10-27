@@ -9,6 +9,7 @@
 | 功能 | 说明 |
 | --- | --- |
 | 菜单栏工作流 | 不需要常驻 Dock 窗口，点击菜单栏即可查看任务。 |
+| 玻璃桌面小组件 | 在菜单栏面板点击图钉，即可把待办常驻到桌面：实时亚克力模糊质感、可拖动换位、右键可吸附到屏幕四角；点收纳按钮缩成小玻璃圆标，点击圆标随时恢复。 |
 | 三步创建 | 依次填写待办内容、选择优先级、选择日期。 |
 | 全局快速收集 | 在任意应用中按 `Option + Command + T`，即可快速记下一件待办。 |
 | 夜间桌面提醒 | 每晚 21:00，直接在桌面显示当天未完成待办的小窗口。 |
@@ -29,6 +30,8 @@ open dist/TodoBar.app
 ```
 
 构建结果位于 `dist/TodoBar.app`。
+
+> 提示：若编译报错 `plugin for module 'SwiftUIMacros' not found`，说明当前 Command Line Tools 缺少 SwiftUI 宏插件（部分版本的已知问题）。安装完整 Xcode，或将 [swift.org 独立工具链](https://www.swift.org/install/macos/) 解压到 `~/Library/Developer/Toolchains/` 即可解决；`build.sh` 会自动优先使用后者。
 
 ## 安全安装
 

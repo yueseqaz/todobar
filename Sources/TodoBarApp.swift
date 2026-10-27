@@ -51,13 +51,441 @@ final class LanguageSettings: ObservableObject {
     }
 }
 
+// MARK: - 玻璃材质（macOS 亚克力/毛玻璃观感）
+
+/// 桥接 NSVisualEffectView，对窗口背后的桌面内容做实时模糊采样
+struct GlassEffectView: NSViewRepresentable {
+    var material: NSVisualEffectView.Material = .sidebar
+    var blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
+    var cornerRadius: CGFloat = 0
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = material
+        view.blendingMode = blendingMode
+        view.state = .active
+        if cornerRadius > 0 {
+            let layer = CALayer()
+            layer.cornerRadius = cornerRadius
+            layer.masksToBounds = true
+            view.layer = layer
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        nsView.material = material
+        nsView.blendingMode = blendingMode
+    }
+}
+
+/// 统一玻璃面板外观：实时模糊底 + 顶部高光渐变 + 玻璃描边
+private struct GlassSurfaceModifier: ViewModifier {
+    var cornerRadius: CGFloat
+    var usesLiveBlur: Bool
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        return content
+            .background {
+                ZStack(alignment: .top) {
+                    if usesLiveBlur {
+                        GlassEffectView()
+                    } else {
+                        Rectangle().fill(.ultraThinMaterial)
+                    }
+                    LinearGradient(
+                        colors: [Color.white.opacity(0.14), Color.white.opacity(0.0)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(height: 92)
+                    .frame(maxWidth: .infinity)
+                }
+            }
+            .clipShape(shape)
+            .overlay {
+                shape
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [Color.white.opacity(0.42), Color.white.opacity(0.07), Color.white.opacity(0.2)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ),
+                        lineWidth: 1
+                    )
+                    .allowsHitTesting(false)
+            }
+    }
+}
+
+extension View {
+    func glassSurface(cornerRadius: CGFloat, usesLiveBlur: Bool = true) -> some View {
+        modifier(GlassSurfaceModifier(cornerRadius: cornerRadius, usesLiveBlur: usesLiveBlur))
+    }
+}
+
+// MARK: - 桌面常驻小组件
+
+enum ScreenCorner {
+    case topLeft
+    case topRight
+    case bottomLeft
+    case bottomRight
+}
+
+/// 无边框、不抢焦点的玻璃面板；App 未激活时也能成为 key，面板内可以直接输入文字
+final class WidgetPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
+@MainActor
+final class DesktopWidgetController: NSObject, ObservableObject {
+    static let expandedSize = NSSize(width: 360, height: 460)
+    static let collapsedSize = NSSize(width: 56, height: 56)
+
+    private static let enabledKey = "TodoBar.widget.enabled"
+    private static let expandedKey = "TodoBar.widget.expanded"
+    private static let frameKey = "TodoBar.widget.frame"
+
+    @Published private(set) var isEnabled: Bool
+    @Published private(set) var isExpanded: Bool
+
+    private var panel: WidgetPanel?
+    private let taskStore: TaskStore
+
+    init(taskStore: TaskStore) {
+        self.taskStore = taskStore
+        let defaults = UserDefaults.standard
+        _isEnabled = Published(initialValue: defaults.bool(forKey: Self.enabledKey))
+        _isExpanded = Published(initialValue: defaults.object(forKey: Self.expandedKey) as? Bool ?? true)
+        super.init()
+    }
+
+    func restoreIfNeeded() {
+        guard isEnabled else { return }
+        showPanel()
+    }
+
+    func toggleEnabled() {
+        setEnabled(!isEnabled)
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        guard isEnabled != enabled else { return }
+        isEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.enabledKey)
+        if enabled {
+            showPanel()
+        } else {
+            panel?.orderOut(nil)
+        }
+    }
+
+    func toggleExpanded() {
+        setExpanded(!isExpanded)
+    }
+
+    func setExpanded(_ expanded: Bool) {
+        guard isExpanded != expanded else { return }
+        isExpanded = expanded
+        UserDefaults.standard.set(expanded, forKey: Self.expandedKey)
+        resizePanel(animated: true)
+    }
+
+    /// 让面板在 App 未激活时也能接收键盘输入（面板内新建/编辑待办）
+    func focusPanel() {
+        panel?.makeKeyAndOrderFront(nil)
+    }
+
+    func snap(to corner: ScreenCorner) {
+        guard let panel else { return }
+        let visible = screenHosting(panel.frame)?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? panel.frame
+        let target = Self.frame(size: panel.frame.size, anchoredTo: corner, in: visible)
+        panel.setFrame(target, display: true, animate: true)
+        panel.invalidateShadow()
+        persistFrame()
+    }
+
+    /// 拖动收纳后的小图标（SwiftUI 的 y 轴向下，窗口坐标 y 轴向上）
+    func moveBy(dx: CGFloat, dy: CGFloat) {
+        guard let panel else { return }
+        var origin = panel.frame.origin
+        origin.x += dx
+        origin.y += dy
+        panel.setFrameOrigin(origin)
+    }
+
+    func finishDragging() {
+        guard let panel else { return }
+        panel.invalidateShadow()
+        persistFrame()
+    }
+
+    private func showPanel() {
+        if panel == nil {
+            panel = makePanel()
+        }
+        guard let panel else { return }
+        let size = isExpanded ? Self.expandedSize : Self.collapsedSize
+
+        if panel.frame.width < 1 || panel.frame.height < 1 {
+            if let saved = savedFrame(), let visible = screenHosting(saved)?.visibleFrame {
+                panel.setFrame(clamp(NSRect(origin: saved.origin, size: size), into: visible), display: false)
+            } else {
+                resizePanel(animated: false)
+            }
+        } else if let visible = screenHosting(panel.frame)?.visibleFrame {
+            panel.setFrame(clamp(panel.frame, into: visible), display: false)
+        }
+
+        panel.orderFrontRegardless()
+        panel.invalidateShadow()
+    }
+
+    private func makePanel() -> WidgetPanel {
+        let panel = WidgetPanel(
+            contentRect: NSRect(origin: .zero, size: Self.expandedSize),
+            styleMask: [.borderless, .nonactivatingPanel, .utilityWindow],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.isMovableByWindowBackground = true
+        panel.hidesOnDeactivate = false
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        panel.isReleasedWhenClosed = false
+        panel.delegate = self
+
+        let hosting = NSHostingView(rootView: WidgetHostRootView(store: taskStore, controller: self))
+        hosting.autoresizingMask = [.width, .height]
+        panel.contentView = hosting
+        return panel
+    }
+
+    /// 展开与收纳共用：把面板切到目标尺寸，并锚定到当前位置最近的屏幕角落
+    private func resizePanel(animated: Bool) {
+        guard let panel else { return }
+        let size = isExpanded ? Self.expandedSize : Self.collapsedSize
+        let visible = screenHosting(panel.frame)?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(origin: .zero, size: size)
+
+        let corner: ScreenCorner
+        if panel.frame.width < 1 || panel.frame.height < 1 {
+            if let saved = savedFrame(), visible.intersects(saved) {
+                corner = Self.nearestCorner(of: saved, in: visible)
+            } else {
+                corner = .topRight
+            }
+        } else {
+            corner = Self.nearestCorner(of: panel.frame, in: visible)
+        }
+
+        panel.setFrame(Self.frame(size: size, anchoredTo: corner, in: visible), display: true, animate: animated)
+        panel.invalidateShadow()
+        persistFrame()
+    }
+
+    private func savedFrame() -> NSRect? {
+        let raw = UserDefaults.standard.string(forKey: Self.frameKey) ?? ""
+        let rect = NSRectFromString(raw)
+        return rect.isEmpty ? nil : rect
+    }
+
+    private func persistFrame() {
+        guard let panel, panel.isVisible else { return }
+        UserDefaults.standard.set(NSStringFromRect(panel.frame), forKey: Self.frameKey)
+    }
+
+    private func screenHosting(_ rect: NSRect) -> NSScreen? {
+        NSScreen.screens.first { $0.visibleFrame.intersects(rect) } ?? NSScreen.main
+    }
+
+    private func clamp(_ rect: NSRect, into visible: NSRect) -> NSRect {
+        var clamped = rect
+        clamped.size.width = min(rect.width, visible.width)
+        clamped.size.height = min(rect.height, visible.height)
+        clamped.origin.x = min(max(clamped.minX, visible.minX), visible.maxX - clamped.width)
+        clamped.origin.y = min(max(clamped.minY, visible.minY), visible.maxY - clamped.height)
+        return clamped
+    }
+
+    static func nearestCorner(of frame: NSRect, in visible: NSRect) -> ScreenCorner {
+        let center = CGPoint(x: frame.midX, y: frame.midY)
+        let candidates: [(ScreenCorner, CGFloat)] = [
+            (.topLeft, hypot(center.x - visible.minX, center.y - visible.maxY)),
+            (.topRight, hypot(center.x - visible.maxX, center.y - visible.maxY)),
+            (.bottomLeft, hypot(center.x - visible.minX, center.y - visible.minY)),
+            (.bottomRight, hypot(center.x - visible.maxX, center.y - visible.minY))
+        ]
+        return candidates.min { $0.1 < $1.1 }?.0 ?? .topRight
+    }
+
+    static func frame(size: NSSize, anchoredTo corner: ScreenCorner, in visible: NSRect, margin: CGFloat = 14) -> NSRect {
+        let origin: CGPoint
+        switch corner {
+        case .topLeft:
+            origin = CGPoint(x: visible.minX + margin, y: visible.maxY - margin - size.height)
+        case .topRight:
+            origin = CGPoint(x: visible.maxX - margin - size.width, y: visible.maxY - margin - size.height)
+        case .bottomLeft:
+            origin = CGPoint(x: visible.minX + margin, y: visible.minY + margin)
+        case .bottomRight:
+            origin = CGPoint(x: visible.maxX - margin - size.width, y: visible.minY + margin)
+        }
+        return NSRect(origin: origin, size: size)
+    }
+}
+
+extension DesktopWidgetController: NSWindowDelegate {
+    func windowDidMove(_ notification: Notification) {
+        persistFrame()
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        persistFrame()
+    }
+}
+
+/// 小组件的宿主视图，把 taskStore 注入 SwiftUI 环境
+private struct WidgetHostRootView: View {
+    let store: TaskStore
+    let controller: DesktopWidgetController
+
+    var body: some View {
+        DesktopWidgetRootView(controller: controller)
+            .environmentObject(store)
+    }
+}
+
+struct DesktopWidgetRootView: View {
+    @ObservedObject var controller: DesktopWidgetController
+    @ObservedObject private var languageSettings = LanguageSettings.shared
+
+    var body: some View {
+        Group {
+            if controller.isExpanded {
+                TodoPanelView(widget: controller, showsWidgetControls: true)
+                    .transition(.scale(scale: 0.92).combined(with: .opacity))
+            } else {
+                WidgetCollapsedBadge(controller: controller)
+                    .transition(.scale(scale: 0.92).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.22), value: controller.isExpanded)
+        .contextMenu { widgetContextMenu }
+    }
+
+    @ViewBuilder
+    private var widgetContextMenu: some View {
+        Button(controller.isExpanded ? t("收纳为小图标", "Collapse to icon") : t("展开面板", "Expand panel")) {
+            controller.toggleExpanded()
+        }
+
+        Divider()
+
+        Menu(t("对齐到屏幕角落", "Snap to corner")) {
+            Button(t("左上角", "Top left")) { controller.snap(to: .topLeft) }
+            Button(t("右上角", "Top right")) { controller.snap(to: .topRight) }
+            Button(t("左下角", "Bottom left")) { controller.snap(to: .bottomLeft) }
+            Button(t("右下角", "Bottom right")) { controller.snap(to: .bottomRight) }
+        }
+
+        Divider()
+
+        Button(role: .destructive) {
+            controller.setEnabled(false)
+        } label: {
+            Label(t("关闭桌面常驻", "Turn off desktop widget"), systemImage: "pin.slash")
+        }
+    }
+
+    private func t(_ chinese: String, _ english: String) -> String {
+        languageSettings.text(chinese, english)
+    }
+}
+
+/// 收纳后的常驻小图标：点击展开，按住拖动换位置
+struct WidgetCollapsedBadge: View {
+    @ObservedObject var controller: DesktopWidgetController
+    @EnvironmentObject private var taskStore: TaskStore
+    @ObservedObject private var languageSettings = LanguageSettings.shared
+    @State private var dragTranslation: CGSize = .zero
+
+    var body: some View {
+        ZStack {
+            GlassEffectView(cornerRadius: 28)
+                .clipShape(Circle())
+
+            Circle()
+                .strokeBorder(
+                    LinearGradient(
+                        colors: [Color.white.opacity(0.45), Color.white.opacity(0.1)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ),
+                    lineWidth: 1
+                )
+
+            if taskStore.remainingCount == 0 {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundStyle(
+                        LinearGradient(colors: [.mint, .teal], startPoint: .topLeading, endPoint: .bottomTrailing)
+                    )
+            } else {
+                VStack(spacing: 1) {
+                    Image(systemName: "checklist")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(
+                            LinearGradient(colors: [.mint, .teal], startPoint: .topLeading, endPoint: .bottomTrailing)
+                        )
+                    Text("\(taskStore.remainingCount)")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(.primary.opacity(0.75))
+                        .monospacedDigit()
+                }
+            }
+        }
+        .frame(width: 56, height: 56)
+        .onTapGesture { controller.setExpanded(true) }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 3)
+                .onChanged { value in
+                    let delta = CGSize(
+                        width: value.translation.width - dragTranslation.width,
+                        height: value.translation.height - dragTranslation.height
+                    )
+                    dragTranslation = value.translation
+                    controller.moveBy(dx: delta.width, dy: -delta.height)
+                }
+                .onEnded { _ in
+                    dragTranslation = .zero
+                    controller.finishDragging()
+                }
+        )
+        .help(t("点击展开 TodoBar，拖动可换位置", "Click to expand TodoBar; drag to reposition"))
+        .accessibilityLabel(t("TodoBar 桌面小组件", "TodoBar desktop widget"))
+    }
+
+    private func t(_ chinese: String, _ english: String) -> String {
+        languageSettings.text(chinese, english)
+    }
+}
+
 @main
 struct TodoBarApp: App {
     @StateObject private var model = TodoBarModel()
 
     var body: some Scene {
         MenuBarExtra {
-            TodoPanelView()
+            TodoPanelView(widget: model.widgetController)
                 .environmentObject(model.taskStore)
         } label: {
             MenuBarLabel(remainingCount: model.taskStore.remainingCount)
@@ -69,13 +497,19 @@ struct TodoBarApp: App {
 @MainActor
 final class TodoBarModel: ObservableObject {
     let taskStore: TaskStore
+    let widgetController: DesktopWidgetController
     private let services: TodoBarServices
 
     init() {
         let store = TaskStore()
         self.taskStore = store
+        self.widgetController = DesktopWidgetController(taskStore: store)
         self.services = TodoBarServices()
         self.services.configure(with: store)
+
+        DispatchQueue.main.async { [weak self] in
+            self?.widgetController.restoreIfNeeded()
+        }
     }
 }
 
@@ -751,6 +1185,8 @@ struct MenuBarLabel: View {
 struct TodoPanelView: View {
     @EnvironmentObject private var taskStore: TaskStore
     @ObservedObject private var languageSettings = LanguageSettings.shared
+    @ObservedObject var widget: DesktopWidgetController
+    var showsWidgetControls = false
     @State private var panelContent: PanelContent = .list
     @State private var completedExpanded = false
 
@@ -793,9 +1229,17 @@ struct TodoPanelView: View {
     var body: some View {
         panelContentView
             .frame(width: 360, height: 460)
-            .background(.ultraThinMaterial)
+            .glassSurface(
+                cornerRadius: showsWidgetControls ? 22 : 10,
+                usesLiveBlur: showsWidgetControls
+            )
             .environment(\.locale, languageSettings.language.locale)
             .preferredColorScheme(nil)
+            .onChange(of: panelContent) { newValue in
+                if showsWidgetControls, newValue != .list {
+                    widget.focusPanel()
+                }
+            }
     }
 
     @ViewBuilder
@@ -894,6 +1338,34 @@ struct TodoPanelView: View {
             }
 
             Spacer(minLength: 12)
+
+            if showsWidgetControls {
+                Button {
+                    widget.setExpanded(false)
+                } label: {
+                    Image(systemName: "chevron.down.circle")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22)
+                        .background(Color.primary.opacity(0.05), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .help(t("收纳为小图标", "Collapse to icon"))
+                .accessibilityLabel(t("收纳为小图标", "Collapse to icon"))
+            }
+
+            Button {
+                widget.toggleEnabled()
+            } label: {
+                Image(systemName: widget.isEnabled ? "pin.fill" : "pin")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(widget.isEnabled ? Color.teal : Color.secondary)
+                    .frame(width: 22, height: 22)
+                    .background(widget.isEnabled ? Color.teal.opacity(0.14) : Color.primary.opacity(0.05), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .help(t("桌面常驻小组件", "Pin to desktop"))
+            .accessibilityLabel(t("桌面常驻小组件", "Pin to desktop"))
 
             Menu {
                 Picker(t("语言", "Language"), selection: $languageSettings.language) {
