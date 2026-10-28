@@ -128,7 +128,7 @@ extension View {
 
 // MARK: - 桌面常驻小组件
 
-enum WidgetSide {
+enum WidgetSide: String {
     case left
     case right
 }
@@ -145,12 +145,26 @@ final class DesktopWidgetController: NSObject, ObservableObject {
 
     private static let enabledKey = "TodoBar.widget.enabled"
     private static let expandedKey = "TodoBar.widget.expanded"
-    private static let frameKey = "TodoBar.widget.frame"
+    private static let displayModeKey = "TodoBar.widget.display"
+    private static let sideKey = "TodoBar.widget.side"
+    private static let yFractionKey = "TodoBar.widget.yFraction"
+    private static let legacyFrameKey = "TodoBar.widget.frame"
+
+    enum DisplayMode: String {
+        case mainDisplay = "main"
+        case allDisplays = "all"
+    }
 
     @Published private(set) var isEnabled: Bool
     @Published private(set) var isExpanded: Bool
+    @Published private(set) var displayMode: DisplayMode
 
-    private var panel: WidgetPanel?
+    /// 每块屏幕一个面板，key 为 CGDirectDisplayID
+    private var panels: [UInt32: WidgetPanel] = [:]
+    /// 逻辑位置：贴靠的侧边 + 垂直方向的比例（0 = 底部，1 = 顶部），各屏幕共用
+    private var side: WidgetSide
+    private var yFraction: Double
+    private var mirrorTimer: Timer?
     private let taskStore: TaskStore
 
     init(taskStore: TaskStore) {
@@ -158,12 +172,49 @@ final class DesktopWidgetController: NSObject, ObservableObject {
         let defaults = UserDefaults.standard
         _isEnabled = Published(initialValue: defaults.bool(forKey: Self.enabledKey))
         _isExpanded = Published(initialValue: defaults.object(forKey: Self.expandedKey) as? Bool ?? true)
+        _displayMode = Published(initialValue: DisplayMode(rawValue: defaults.string(forKey: Self.displayModeKey) ?? "") ?? .mainDisplay)
+
+        // 迁移旧版单面板坐标；没有记录时默认右上角
+        var parsedSide: WidgetSide?
+        if let raw = defaults.string(forKey: Self.sideKey) {
+            parsedSide = WidgetSide(rawValue: raw)
+        }
+        var parsedFraction: Double?
+        if let value = defaults.object(forKey: Self.yFractionKey) as? Double {
+            parsedFraction = value
+        }
+        if parsedSide == nil || parsedFraction == nil,
+           let legacy = legacySavedFrame(),
+           let screen = NSScreen.screens.first(where: { $0.visibleFrame.intersects(legacy) }) ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            if parsedSide == nil {
+                parsedSide = Self.nearestSide(of: legacy, in: visible)
+            }
+            if parsedFraction == nil {
+                parsedFraction = Self.fraction(of: legacy.origin.y, height: legacy.height, in: visible)
+            }
+        }
+        side = parsedSide ?? .right
+        yFraction = parsedFraction ?? 1
+
         super.init()
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screensChanged),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
     }
 
     func restoreIfNeeded() {
         guard isEnabled else { return }
-        showPanel()
+        rebuildPanels()
+        applyLayout(animated: false)
+        panels.values.forEach {
+            $0.orderFrontRegardless()
+            $0.invalidateShadow()
+        }
     }
 
     func toggleEnabled() {
@@ -175,10 +226,26 @@ final class DesktopWidgetController: NSObject, ObservableObject {
         isEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: Self.enabledKey)
         if enabled {
-            showPanel()
+            rebuildPanels()
+            applyLayout(animated: false)
+            panels.values.forEach {
+                $0.orderFrontRegardless()
+                $0.invalidateShadow()
+            }
         } else {
-            panel?.orderOut(nil)
+            panels.values.forEach { $0.orderOut(nil) }
         }
+    }
+
+    /// 设置项：仅在主屏幕显示 / 每块屏幕都显示
+    func setDisplayMode(_ mode: DisplayMode) {
+        guard displayMode != mode else { return }
+        displayMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: Self.displayModeKey)
+        guard isEnabled else { return }
+        rebuildPanels()
+        applyLayout(animated: false)
+        panels.values.forEach { $0.orderFrontRegardless() }
     }
 
     func toggleExpanded() {
@@ -189,30 +256,31 @@ final class DesktopWidgetController: NSObject, ObservableObject {
         guard isExpanded != expanded else { return }
         isExpanded = expanded
         UserDefaults.standard.set(expanded, forKey: Self.expandedKey)
-        resizePanel(animated: true)
+        applyLayout(animated: true)
     }
 
     /// 让面板在 App 未激活时也能接收键盘输入（面板内新建/编辑待办）
     func focusPanel() {
-        panel?.makeKeyAndOrderFront(nil)
+        let target = panelUnderMouse() ?? panels.values.first { $0.isVisible }
+        target?.makeKeyAndOrderFront(nil)
     }
 
     /// 菜单栏「打开面板」：始终展开并显示
     func expandFromStatusBar() {
         guard isEnabled else { return }
-        if panel == nil {
-            showPanel()
+        if panels.isEmpty {
+            rebuildPanels()
         }
         if !isExpanded {
             setExpanded(true)
         }
-        panel?.orderFrontRegardless()
+        panels.values.forEach { $0.orderFrontRegardless() }
     }
 
     /// 菜单栏左键点按：展开 ⇄ 收纳成小图标
     func toggleFromStatusBar() {
         guard isEnabled else { return }
-        if let panel, panel.isVisible, isExpanded {
+        if isExpanded, !panels.isEmpty {
             setExpanded(false)
         } else {
             expandFromStatusBar()
@@ -220,56 +288,62 @@ final class DesktopWidgetController: NSObject, ObservableObject {
     }
 
     func snap(to side: WidgetSide) {
-        guard let panel else { return }
-        let visible = screenHosting(panel.frame)?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
-            ?? panel.frame
-        let target = Self.frame(size: panel.frame.size, side: side, y: panel.frame.origin.y, in: visible)
-        panel.setFrame(target, display: true, animate: true)
-        panel.invalidateShadow()
-        persistFrame()
+        self.side = side
+        persistPosition()
+        applyLayout(animated: true)
     }
 
     /// 拖动收纳后的小图标（SwiftUI 的 y 轴向下，窗口坐标 y 轴向上）
     func moveBy(dx: CGFloat, dy: CGFloat) {
-        guard let panel else { return }
-        var origin = panel.frame.origin
+        guard let target = panelUnderMouse() else { return }
+        var origin = target.frame.origin
         origin.x += dx
         origin.y += dy
-        panel.setFrameOrigin(origin)
+        target.setFrameOrigin(origin)
     }
 
     func finishDragging() {
-        guard let panel else { return }
-        // 悬浮窗只贴靠屏幕左右两侧：松手时水平方向吸附到较近的一边
-        let visible = screenHosting(panel.frame)?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
-            ?? panel.frame
-        let side = Self.nearestSide(of: panel.frame, in: visible)
-        panel.setFrame(Self.frame(size: panel.frame.size, side: side, y: panel.frame.origin.y, in: visible), display: false)
-        panel.invalidateShadow()
-        persistFrame()
+        guard let target = panelUnderMouse() else { return }
+        // 悬浮窗只贴靠屏幕左右两侧：松手时按所在屏幕吸附，并镜像到其他屏幕
+        recordPosition(from: target.frame, screen: target.screen ?? screenHosting(target.frame))
+        applyLayout(animated: false)
+        panels.values.forEach { $0.invalidateShadow() }
+        persistPosition()
     }
 
-    private func showPanel() {
-        if panel == nil {
-            panel = makePanel()
+    // MARK: Private
+
+    private func rebuildPanels() {
+        let desired = desiredDisplayIDs()
+        for (id, panel) in panels where !desired.contains(id) {
+            panel.orderOut(nil)
+            panels[id] = nil
         }
-        guard let panel else { return }
+        for id in desired where panels[id] == nil {
+            panels[id] = makePanel()
+        }
+    }
+
+    private func desiredDisplayIDs() -> Set<UInt32> {
+        let screens = displayMode == .allDisplays ? NSScreen.screens : Array(NSScreen.screens.prefix(1))
+        return Set(screens.compactMap(Self.displayID(of:)))
+    }
+
+    private func applyLayout(animated: Bool) {
         let size = isExpanded ? Self.expandedSize : Self.collapsedSize
-
-        if panel.frame.width < 1 || panel.frame.height < 1 {
-            if let saved = savedFrame(), let visible = screenHosting(saved)?.visibleFrame {
-                panel.setFrame(clamp(NSRect(origin: saved.origin, size: size), into: visible), display: false)
-            } else {
-                resizePanel(animated: false)
+        for (_, panel) in panels {
+            guard let screen = panel.screen ?? screenHosting(panel.frame) else { continue }
+            let visible = screen.visibleFrame
+            let y = visible.minY + CGFloat(yFraction) * max(visible.height - size.height, 0)
+            let target = Self.frame(size: size, side: side, y: y, in: visible)
+            if abs(panel.frame.origin.x - target.origin.x) > 0.5
+                || abs(panel.frame.origin.y - target.origin.y) > 0.5
+                || abs(panel.frame.width - target.width) > 0.5
+                || abs(panel.frame.height - target.height) > 0.5 {
+                panel.setFrame(target, display: true, animate: animated)
             }
-        } else if let visible = screenHosting(panel.frame)?.visibleFrame {
-            panel.setFrame(clamp(panel.frame, into: visible), display: false)
         }
-
-        panel.orderFrontRegardless()
-        panel.invalidateShadow()
+        panels.values.forEach { $0.invalidateShadow() }
     }
 
     private func makePanel() -> WidgetPanel {
@@ -295,60 +369,51 @@ final class DesktopWidgetController: NSObject, ObservableObject {
         return panel
     }
 
-    /// 展开与收纳共用：把面板切到目标尺寸，水平贴靠当前一侧，顶部边缘保持不动
-    private func resizePanel(animated: Bool) {
-        guard let panel else { return }
-        let size = isExpanded ? Self.expandedSize : Self.collapsedSize
-        let visible = screenHosting(panel.frame)?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
-            ?? NSRect(origin: .zero, size: size)
-
-        let side: WidgetSide
-        let y: CGFloat
-        if panel.frame.width < 1 || panel.frame.height < 1 {
-            if let saved = savedFrame(), visible.intersects(saved) {
-                side = Self.nearestSide(of: saved, in: visible)
-                y = saved.origin.y
-            } else {
-                side = .right
-                y = visible.maxY - 14 - size.height
-            }
-        } else {
-            side = Self.nearestSide(of: panel.frame, in: visible)
-            y = panel.frame.maxY - size.height
-        }
-
-        panel.setFrame(Self.frame(size: size, side: side, y: y, in: visible), display: true, animate: animated)
-        panel.invalidateShadow()
-        persistFrame()
+    private func panelUnderMouse() -> WidgetPanel? {
+        panels.values.first { $0.isVisible && $0.frame.contains(NSEvent.mouseLocation) }
+            ?? panels.values.first { $0.isVisible }
     }
 
-    private func savedFrame() -> NSRect? {
-        let raw = UserDefaults.standard.string(forKey: Self.frameKey) ?? ""
+    private func recordPosition(from frame: NSRect, screen: NSScreen?) {
+        guard let screen else { return }
+        let visible = screen.visibleFrame
+        side = Self.nearestSide(of: frame, in: visible)
+        yFraction = Self.fraction(of: frame.origin.y, height: frame.height, in: visible)
+    }
+
+    private func persistPosition() {
+        UserDefaults.standard.set(side.rawValue, forKey: Self.sideKey)
+        UserDefaults.standard.set(yFraction, forKey: Self.yFractionKey)
+    }
+
+    private static func legacySavedFrame() -> NSRect? {
+        let raw = UserDefaults.standard.string(forKey: legacyFrameKey) ?? ""
         let rect = NSRectFromString(raw)
         return rect.isEmpty ? nil : rect
     }
 
-    private func persistFrame() {
-        guard let panel, panel.isVisible else { return }
-        UserDefaults.standard.set(NSStringFromRect(panel.frame), forKey: Self.frameKey)
+    private static func displayID(of screen: NSScreen) -> UInt32? {
+        screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? UInt32
     }
 
     private func screenHosting(_ rect: NSRect) -> NSScreen? {
         NSScreen.screens.first { $0.visibleFrame.intersects(rect) } ?? NSScreen.main
     }
 
-    private func clamp(_ rect: NSRect, into visible: NSRect) -> NSRect {
-        var clamped = rect
-        clamped.size.width = min(rect.width, visible.width)
-        clamped.size.height = min(rect.height, visible.height)
-        clamped.origin.x = min(max(clamped.minX, visible.minX), visible.maxX - clamped.width)
-        clamped.origin.y = min(max(clamped.minY, visible.minY), visible.maxY - clamped.height)
-        return clamped
+    @objc private func screensChanged() {
+        guard isEnabled else { return }
+        rebuildPanels()
+        applyLayout(animated: false)
+        panels.values.forEach { $0.orderFrontRegardless() }
     }
 
     static func nearestSide(of frame: NSRect, in visible: NSRect) -> WidgetSide {
         frame.midX < visible.midX ? .left : .right
+    }
+
+    static func fraction(of y: CGFloat, height: CGFloat, in visible: NSRect) -> Double {
+        let span = max(visible.height - height, 1)
+        return Double(min(max((y - visible.minY) / span, 0), 1))
     }
 
     static func frame(size: NSSize, side: WidgetSide, y: CGFloat, in visible: NSRect, margin: CGFloat = 14) -> NSRect {
@@ -360,11 +425,26 @@ final class DesktopWidgetController: NSObject, ObservableObject {
 
 extension DesktopWidgetController: NSWindowDelegate {
     func windowDidMove(_ notification: Notification) {
-        persistFrame()
+        guard let window = notification.object as? NSPanel,
+              panels.contains(where: { $0.value === window }) else { return }
+        recordPosition(from: window.frame, screen: window.screen ?? screenHosting(window.frame))
+        persistPosition()
+        scheduleMirror()
     }
 
     func windowDidEndLiveResize(_ notification: Notification) {
-        persistFrame()
+        applyLayout(animated: false)
+        persistPosition()
+    }
+
+    /// 拖动停止后把逻辑位置镜像到其余屏幕（用防抖避免拖动过程中反复同步）
+    private func scheduleMirror() {
+        mirrorTimer?.invalidate()
+        mirrorTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.applyLayout(animated: false)
+            }
+        }
     }
 }
 
@@ -797,6 +877,26 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         widgetToggle.state = widgetController.isEnabled ? .on : .off
         settingsMenu.addItem(widgetToggle)
 
+        let displayItem = NSMenuItem(title: t("显示屏幕", "Displays"), action: nil, keyEquivalent: "")
+        let displayMenu = NSMenu(title: t("显示屏幕", "Displays"))
+        let displayModes: [(DesktopWidgetController.DisplayMode, String, String)] = [
+            (.mainDisplay, "仅主屏幕", "Main display only"),
+            (.allDisplays, "所有屏幕", "All displays")
+        ]
+        for (mode, chinese, english) in displayModes {
+            let item = NSMenuItem(
+                title: t(chinese, english),
+                action: #selector(selectDisplayMode(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = mode.rawValue
+            item.state = widgetController.displayMode == mode ? .on : .off
+            displayMenu.addItem(item)
+        }
+        displayItem.submenu = displayMenu
+        settingsMenu.addItem(displayItem)
+
         settingsItem.submenu = settingsMenu
         contextMenu.addItem(settingsItem)
 
@@ -840,6 +940,12 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     @objc private func toggleWidgetFromMenu() {
         widgetController.toggleEnabled()
+    }
+
+    @objc private func selectDisplayMode(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let mode = DesktopWidgetController.DisplayMode(rawValue: raw) else { return }
+        widgetController.setDisplayMode(mode)
     }
 
     @objc private func selectLanguage(_ sender: NSMenuItem) {

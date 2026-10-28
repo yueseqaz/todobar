@@ -9,7 +9,7 @@ A lightweight native macOS menu bar to-do app for capturing work before it slips
 | Capability | Details |
 | --- | --- |
 | Menu bar workflow | Keep the task list one click away without a Dock window. |
-| Glass desktop widget | Pin the panel to the desktop from the menu-bar panel: real-time acrylic blur, draggable and auto-snapped to the left or right screen edge; the menu-bar icon toggles between expanded and collapsed; the panel header shows today's completion progress. |
+| Glass desktop widget | Pin the panel to the desktop from the menu-bar panel: real-time acrylic blur, draggable and auto-snapped to the left or right screen edge; show it on the main display or on every display from Settings; the menu-bar icon toggles between expanded and collapsed; the panel header shows today's completion progress. |
 | Three-step creation | Create a task in order: content, priority, then date. |
 | Global quick capture | Press `Option + Command + T` from any app to capture a task. |
 | Evening desktop reminder | At 9 PM, TodoBar shows its own floating desktop window for unfinished tasks due today. |
