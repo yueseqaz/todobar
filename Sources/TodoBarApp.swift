@@ -184,7 +184,7 @@ final class DesktopWidgetController: NSObject, ObservableObject {
             parsedFraction = value
         }
         if parsedSide == nil || parsedFraction == nil,
-           let legacy = legacySavedFrame(),
+           let legacy = Self.legacySavedFrame(),
            let screen = NSScreen.screens.first(where: { $0.visibleFrame.intersects(legacy) }) ?? NSScreen.main {
             let visible = screen.visibleFrame
             if parsedSide == nil {
