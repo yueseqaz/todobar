@@ -135,6 +135,10 @@ enum WidgetSide: String {
 
 /// 无边框、不抢焦点的玻璃面板；App 未激活时也能成为 key，面板内可以直接输入文字
 final class WidgetPanel: NSPanel {
+    /// The display this panel belongs to. Keeping this on the window avoids
+    /// guessing from its frame while it is being moved between displays.
+    var displayID: UInt32?
+
     override var canBecomeKey: Bool { true }
 }
 
@@ -145,9 +149,11 @@ final class DesktopWidgetController: NSObject, ObservableObject {
 
     private static let enabledKey = "TodoBar.widget.enabled"
     private static let expandedKey = "TodoBar.widget.expanded"
+    private static let expandedDisplayKey = "TodoBar.widget.expandedDisplay"
     private static let displayModeKey = "TodoBar.widget.display"
     private static let sideKey = "TodoBar.widget.side"
     private static let yFractionKey = "TodoBar.widget.yFraction"
+    private static let yFractionsKey = "TodoBar.widget.yFractions"
     private static let legacyFrameKey = "TodoBar.widget.frame"
 
     enum DisplayMode: String {
@@ -159,11 +165,17 @@ final class DesktopWidgetController: NSObject, ObservableObject {
     @Published private(set) var isExpanded: Bool
     @Published private(set) var displayMode: DisplayMode
 
-    /// 每块屏幕一个面板，key 为 CGDirectDisplayID
+    var currentSide: WidgetSide { side }
+
+    /// 每块屏幕一个面板，key 为显示器 ID。
     private var panels: [UInt32: WidgetPanel] = [:]
-    /// 逻辑位置：贴靠的侧边 + 垂直方向的比例（0 = 底部，1 = 顶部），各屏幕共用
+    /// 逻辑位置：贴靠的侧边由设置决定，垂直方向的位置按屏幕独立保存。
     private var side: WidgetSide
-    private var yFraction: Double
+    private var yFractions: [UInt32: Double]
+    private var expandedPanelIDs: Set<UInt32> = []
+    private var preferredExpandedDisplayID: UInt32?
+    private var draggingPanelID: UInt32?
+    private var isDragging = false
     private var mirrorTimer: Timer?
     private let taskStore: TaskStore
 
@@ -173,6 +185,7 @@ final class DesktopWidgetController: NSObject, ObservableObject {
         _isEnabled = Published(initialValue: defaults.bool(forKey: Self.enabledKey))
         _isExpanded = Published(initialValue: defaults.object(forKey: Self.expandedKey) as? Bool ?? true)
         _displayMode = Published(initialValue: DisplayMode(rawValue: defaults.string(forKey: Self.displayModeKey) ?? "") ?? .mainDisplay)
+        preferredExpandedDisplayID = defaults.object(forKey: Self.expandedDisplayKey) as? UInt32
 
         // 迁移旧版单面板坐标；没有记录时默认右上角
         var parsedSide: WidgetSide?
@@ -195,7 +208,21 @@ final class DesktopWidgetController: NSObject, ObservableObject {
             }
         }
         side = parsedSide ?? .right
-        yFraction = parsedFraction ?? 1
+        if let saved = defaults.dictionary(forKey: Self.yFractionsKey) {
+            yFractions = saved.reduce(into: [:]) { result, entry in
+                if let id = UInt32(entry.key), let fraction = entry.value as? Double {
+                    result[id] = fraction
+                }
+            }
+        } else {
+            yFractions = [:]
+        }
+        // Keep the old single-screen setting as a fallback for existing installs.
+        if let parsedFraction, yFractions[0] == nil {
+            // A zero key is a legacy fallback; real display IDs replace it as
+            // soon as a panel is laid out or dragged.
+            yFractions[0] = parsedFraction
+        }
 
         super.init()
 
@@ -249,13 +276,42 @@ final class DesktopWidgetController: NSObject, ObservableObject {
     }
 
     func toggleExpanded() {
-        setExpanded(!isExpanded)
+        let target = panelUnderMouse() ?? panels.values.first { $0.isVisible }
+        if let target, let id = target.displayID {
+            setExpanded(!isExpanded(for: id), for: id)
+        } else {
+            setExpanded(!isExpanded)
+        }
     }
 
     func setExpanded(_ expanded: Bool) {
+        let target = panelUnderMouse() ?? panels.values.first { $0.isVisible }
+        if let target, let id = target.displayID {
+            setExpanded(expanded, for: id)
+            return
+        }
         guard isExpanded != expanded else { return }
         isExpanded = expanded
         UserDefaults.standard.set(expanded, forKey: Self.expandedKey)
+        applyLayout(animated: true)
+    }
+
+    func isExpanded(for displayID: UInt32) -> Bool {
+        expandedPanelIDs.contains(displayID)
+    }
+
+    func setExpanded(_ expanded: Bool, for displayID: UInt32) {
+        if expanded {
+            // Expand only the panel that was clicked. Other displays keep their
+            // own state instead of being opened as a side effect.
+            expandedPanelIDs.insert(displayID)
+            preferredExpandedDisplayID = displayID
+            UserDefaults.standard.set(displayID, forKey: Self.expandedDisplayKey)
+        } else {
+            expandedPanelIDs.remove(displayID)
+        }
+        isExpanded = !expandedPanelIDs.isEmpty
+        UserDefaults.standard.set(isExpanded, forKey: Self.expandedKey)
         applyLayout(animated: true)
     }
 
@@ -265,26 +321,30 @@ final class DesktopWidgetController: NSObject, ObservableObject {
         target?.makeKeyAndOrderFront(nil)
     }
 
+    func focusPanel(on displayID: UInt32) {
+        (panels[displayID] ?? panelUnderMouse())?.makeKeyAndOrderFront(nil)
+    }
+
     /// 菜单栏「打开面板」：始终展开并显示
     func expandFromStatusBar() {
         guard isEnabled else { return }
         if panels.isEmpty {
             rebuildPanels()
         }
-        if !isExpanded {
-            setExpanded(true)
+        let target = panelUnderMouse() ?? panels.values.first { $0.isVisible }
+        if let target, let id = target.displayID {
+            setExpanded(true, for: id)
+            target.orderFrontRegardless()
         }
-        panels.values.forEach { $0.orderFrontRegardless() }
     }
 
     /// 菜单栏左键点按：展开 ⇄ 收纳成小图标
     func toggleFromStatusBar() {
         guard isEnabled else { return }
-        if isExpanded, !panels.isEmpty {
-            setExpanded(false)
-        } else {
-            expandFromStatusBar()
-        }
+        let target = panelUnderMouse() ?? panels.values.first { $0.isVisible }
+        guard let target, let id = target.displayID else { return }
+        setExpanded(!isExpanded(for: id), for: id)
+        target.orderFrontRegardless()
     }
 
     func snap(to side: WidgetSide) {
@@ -294,18 +354,36 @@ final class DesktopWidgetController: NSObject, ObservableObject {
     }
 
     /// 拖动收纳后的小图标（SwiftUI 的 y 轴向下，窗口坐标 y 轴向上）
+    func beginDragging() {
+        guard let target = panelUnderMouse(), let id = target.displayID else { return }
+        draggingPanelID = id
+        isDragging = true
+    }
+
     func moveBy(dx: CGFloat, dy: CGFloat) {
-        guard let target = panelUnderMouse() else { return }
+        _ = dx
+        let target = draggingPanelID.flatMap { panels[$0] } ?? panelUnderMouse()
+        guard let target else { return }
+        if draggingPanelID == nil { draggingPanelID = target.displayID }
+        isDragging = true
         var origin = target.frame.origin
-        origin.x += dx
+        // The side is controlled from Settings. Dragging only changes the
+        // vertical position, which keeps the gesture predictable and smooth.
         origin.y += dy
+        if let screen = screenForPanel(target) {
+            origin.x = Self.frame(size: target.frame.size, side: side, y: origin.y, in: screen.visibleFrame).origin.x
+        }
         target.setFrameOrigin(origin)
     }
 
     func finishDragging() {
-        guard let target = panelUnderMouse() else { return }
-        // 悬浮窗只贴靠屏幕左右两侧：松手时按所在屏幕吸附，并镜像到其他屏幕
-        recordPosition(from: target.frame, screen: target.screen ?? screenHosting(target.frame))
+        let target = draggingPanelID.flatMap { panels[$0] } ?? panelUnderMouse()
+        guard let target else { return }
+        mirrorTimer?.invalidate()
+        isDragging = false
+        // Keep the configured side and save a separate vertical position per display.
+        recordPosition(from: target.frame, screen: screenForPanel(target))
+        draggingPanelID = nil
         applyLayout(animated: false)
         panels.values.forEach { $0.invalidateShadow() }
         persistPosition()
@@ -320,8 +398,13 @@ final class DesktopWidgetController: NSObject, ObservableObject {
             panels[id] = nil
         }
         for id in desired where panels[id] == nil {
-            panels[id] = makePanel()
+            panels[id] = makePanel(displayID: id)
         }
+        expandedPanelIDs.formIntersection(desired)
+        if expandedPanelIDs.isEmpty, isExpanded, let preferredID = preferredDisplayID(in: desired) {
+            expandedPanelIDs = [preferredID]
+        }
+        isExpanded = !expandedPanelIDs.isEmpty
     }
 
     private func desiredDisplayIDs() -> Set<UInt32> {
@@ -330,11 +413,13 @@ final class DesktopWidgetController: NSObject, ObservableObject {
     }
 
     private func applyLayout(animated: Bool) {
-        let size = isExpanded ? Self.expandedSize : Self.collapsedSize
         for (_, panel) in panels {
-            guard let screen = panel.screen ?? screenHosting(panel.frame) else { continue }
+            guard let screen = screenForPanel(panel) else { continue }
+            let expanded = panel.displayID.map { isExpanded(for: $0) } ?? isExpanded
+            let size = expanded ? Self.expandedSize : Self.collapsedSize
             let visible = screen.visibleFrame
-            let y = visible.minY + CGFloat(yFraction) * max(visible.height - size.height, 0)
+            let fraction = yFractions[panel.displayID ?? 0] ?? yFractions[0] ?? 1
+            let y = visible.minY + CGFloat(fraction) * max(visible.height - size.height, 0)
             let target = Self.frame(size: size, side: side, y: y, in: visible)
             if abs(panel.frame.origin.x - target.origin.x) > 0.5
                 || abs(panel.frame.origin.y - target.origin.y) > 0.5
@@ -346,44 +431,60 @@ final class DesktopWidgetController: NSObject, ObservableObject {
         panels.values.forEach { $0.invalidateShadow() }
     }
 
-    private func makePanel() -> WidgetPanel {
+    private func makePanel(displayID: UInt32) -> WidgetPanel {
         let panel = WidgetPanel(
             contentRect: NSRect(origin: .zero, size: Self.expandedSize),
             styleMask: [.borderless, .nonactivatingPanel, .utilityWindow],
             backing: .buffered,
             defer: false
         )
+        panel.displayID = displayID
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        panel.isMovableByWindowBackground = true
+        // Keep the expanded panel anchored to the configured edge. The
+        // collapsed badge provides the dedicated vertical drag gesture.
+        panel.isMovableByWindowBackground = false
         panel.hidesOnDeactivate = false
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.isReleasedWhenClosed = false
         panel.delegate = self
 
-        let hosting = NSHostingView(rootView: WidgetHostRootView(store: taskStore, controller: self))
+        let hosting = NSHostingView(rootView: WidgetHostRootView(store: taskStore, controller: self, panelID: displayID))
         hosting.autoresizingMask = [.width, .height]
         panel.contentView = hosting
         return panel
     }
 
     private func panelUnderMouse() -> WidgetPanel? {
-        panels.values.first { $0.isVisible && $0.frame.contains(NSEvent.mouseLocation) }
-            ?? panels.values.first { $0.isVisible }
+        let mouse = NSEvent.mouseLocation
+        if let panel = panels.values.first(where: { $0.isVisible && $0.frame.contains(mouse) }) {
+            return panel
+        }
+        if let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }),
+           let id = Self.displayID(of: screen),
+           let panel = panels[id], panel.isVisible {
+            return panel
+        }
+        return panels.values.first { $0.isVisible }
     }
 
     private func recordPosition(from frame: NSRect, screen: NSScreen?) {
         guard let screen else { return }
         let visible = screen.visibleFrame
-        side = Self.nearestSide(of: frame, in: visible)
-        yFraction = Self.fraction(of: frame.origin.y, height: frame.height, in: visible)
+        let id = Self.displayID(of: screen) ?? draggingPanelID ?? 0
+        yFractions[id] = Self.fraction(of: frame.origin.y, height: frame.height, in: visible)
     }
 
     private func persistPosition() {
         UserDefaults.standard.set(side.rawValue, forKey: Self.sideKey)
-        UserDefaults.standard.set(yFraction, forKey: Self.yFractionKey)
+        let encoded = yFractions.reduce(into: [String: Double]()) { result, entry in
+            result[String(entry.key)] = entry.value
+        }
+        UserDefaults.standard.set(encoded, forKey: Self.yFractionsKey)
+        // Keep this for older builds that only know one vertical position.
+        UserDefaults.standard.set(yFractions.values.first ?? 1, forKey: Self.yFractionKey)
     }
 
     private static func legacySavedFrame() -> NSRect? {
@@ -398,6 +499,22 @@ final class DesktopWidgetController: NSObject, ObservableObject {
 
     private func screenHosting(_ rect: NSRect) -> NSScreen? {
         NSScreen.screens.first { $0.visibleFrame.intersects(rect) } ?? NSScreen.main
+    }
+
+    private func screenForPanel(_ panel: WidgetPanel) -> NSScreen? {
+        if let id = panel.displayID,
+           let screen = NSScreen.screens.first(where: { Self.displayID(of: $0) == id }) {
+            return screen
+        }
+        return panel.screen ?? screenHosting(panel.frame)
+    }
+
+    private func preferredDisplayID(in ids: Set<UInt32>) -> UInt32? {
+        if let preferredExpandedDisplayID, ids.contains(preferredExpandedDisplayID) {
+            return preferredExpandedDisplayID
+        }
+        if let mainID = NSScreen.main.flatMap(Self.displayID(of:)), ids.contains(mainID) { return mainID }
+        return ids.first
     }
 
     @objc private func screensChanged() {
@@ -425,9 +542,10 @@ final class DesktopWidgetController: NSObject, ObservableObject {
 
 extension DesktopWidgetController: NSWindowDelegate {
     func windowDidMove(_ notification: Notification) {
-        guard let window = notification.object as? NSPanel,
+        guard !isDragging,
+              let window = notification.object as? WidgetPanel,
               panels.contains(where: { $0.value === window }) else { return }
-        recordPosition(from: window.frame, screen: window.screen ?? screenHosting(window.frame))
+        recordPosition(from: window.frame, screen: screenForPanel(window))
         persistPosition()
         scheduleMirror()
     }
@@ -452,35 +570,37 @@ extension DesktopWidgetController: NSWindowDelegate {
 private struct WidgetHostRootView: View {
     let store: TaskStore
     let controller: DesktopWidgetController
+    let panelID: UInt32
 
     var body: some View {
-        DesktopWidgetRootView(controller: controller)
+        DesktopWidgetRootView(controller: controller, panelID: panelID)
             .environmentObject(store)
     }
 }
 
 struct DesktopWidgetRootView: View {
     @ObservedObject var controller: DesktopWidgetController
+    let panelID: UInt32
     @ObservedObject private var languageSettings = LanguageSettings.shared
 
     var body: some View {
         Group {
-            if controller.isExpanded {
-                TodoPanelView(widget: controller, showsWidgetControls: true)
+            if controller.isExpanded(for: panelID) {
+                TodoPanelView(widget: controller, panelID: panelID, showsWidgetControls: true)
                     .transition(.scale(scale: 0.92).combined(with: .opacity))
             } else {
-                WidgetCollapsedBadge(controller: controller)
+                WidgetCollapsedBadge(controller: controller, panelID: panelID)
                     .transition(.scale(scale: 0.92).combined(with: .opacity))
             }
         }
-        .animation(.easeInOut(duration: 0.22), value: controller.isExpanded)
+        .animation(.easeInOut(duration: 0.22), value: controller.isExpanded(for: panelID))
         .contextMenu { widgetContextMenu }
     }
 
     @ViewBuilder
     private var widgetContextMenu: some View {
-        Button(controller.isExpanded ? t("收纳为小图标", "Collapse to icon") : t("展开面板", "Expand panel")) {
-            controller.toggleExpanded()
+        Button(controller.isExpanded(for: panelID) ? t("收纳为小图标", "Collapse to icon") : t("展开面板", "Expand panel")) {
+            controller.setExpanded(!controller.isExpanded(for: panelID), for: panelID)
         }
 
         Divider()
@@ -505,9 +625,11 @@ struct DesktopWidgetRootView: View {
 /// 收纳后的常驻小图标：点击展开，按住拖动换位置
 struct WidgetCollapsedBadge: View {
     @ObservedObject var controller: DesktopWidgetController
+    let panelID: UInt32
     @EnvironmentObject private var taskStore: TaskStore
     @ObservedObject private var languageSettings = LanguageSettings.shared
     @State private var dragTranslation: CGSize = .zero
+    @State private var dragStarted = false
 
     var body: some View {
         ZStack {
@@ -545,10 +667,17 @@ struct WidgetCollapsedBadge: View {
             }
         }
         .frame(width: 56, height: 56)
-        .onTapGesture { controller.setExpanded(true) }
+        .onTapGesture {
+            guard !dragStarted else { return }
+            controller.setExpanded(true, for: panelID)
+        }
         .simultaneousGesture(
             DragGesture(minimumDistance: 3)
                 .onChanged { value in
+                    if !dragStarted {
+                        dragStarted = true
+                        controller.beginDragging()
+                    }
                     let delta = CGSize(
                         width: value.translation.width - dragTranslation.width,
                         height: value.translation.height - dragTranslation.height
@@ -559,9 +688,11 @@ struct WidgetCollapsedBadge: View {
                 .onEnded { _ in
                     dragTranslation = .zero
                     controller.finishDragging()
+                    // Let a pending tap gesture observe that this was a drag.
+                    DispatchQueue.main.async { dragStarted = false }
                 }
         )
-        .help(t("点击展开 TodoBar，拖动可换位置", "Click to expand TodoBar; drag to reposition"))
+        .help(t("点击展开 TodoBar，上下拖动调整位置", "Click to expand TodoBar; drag vertically to reposition"))
         .accessibilityLabel(t("TodoBar 桌面小组件", "TodoBar desktop widget"))
     }
 
@@ -897,6 +1028,26 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         displayItem.submenu = displayMenu
         settingsMenu.addItem(displayItem)
 
+        let sideItem = NSMenuItem(title: t("停靠侧边", "Dock side"), action: nil, keyEquivalent: "")
+        let sideMenu = NSMenu(title: t("停靠侧边", "Dock side"))
+        let sideModes: [(WidgetSide, String, String)] = [
+            (.left, "屏幕左侧", "Left edge"),
+            (.right, "屏幕右侧", "Right edge")
+        ]
+        for (side, chinese, english) in sideModes {
+            let item = NSMenuItem(
+                title: t(chinese, english),
+                action: #selector(selectWidgetSide(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = side.rawValue
+            item.state = widgetController.currentSide == side ? .on : .off
+            sideMenu.addItem(item)
+        }
+        sideItem.submenu = sideMenu
+        settingsMenu.addItem(sideItem)
+
         settingsItem.submenu = settingsMenu
         contextMenu.addItem(settingsItem)
 
@@ -946,6 +1097,12 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         guard let raw = sender.representedObject as? String,
               let mode = DesktopWidgetController.DisplayMode(rawValue: raw) else { return }
         widgetController.setDisplayMode(mode)
+    }
+
+    @objc private func selectWidgetSide(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let side = WidgetSide(rawValue: raw) else { return }
+        widgetController.snap(to: side)
     }
 
     @objc private func selectLanguage(_ sender: NSMenuItem) {
@@ -1738,6 +1895,7 @@ struct TodoPanelView: View {
     @EnvironmentObject private var taskStore: TaskStore
     @ObservedObject private var languageSettings = LanguageSettings.shared
     @ObservedObject var widget: DesktopWidgetController
+    var panelID: UInt32? = nil
     var showsWidgetControls = false
     @State private var panelContent: PanelContent = .list
     @State private var completedExpanded = false
@@ -1786,7 +1944,11 @@ struct TodoPanelView: View {
             .preferredColorScheme(nil)
             .onChange(of: panelContent) { newValue in
                 if showsWidgetControls, newValue != .list {
-                    widget.focusPanel()
+                    if let panelID {
+                        widget.focusPanel(on: panelID)
+                    } else {
+                        widget.focusPanel()
+                    }
                 }
             }
     }
@@ -1829,10 +1991,17 @@ struct TodoPanelView: View {
 
             Divider().opacity(0.35)
 
-            ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 18) {
-                    createTaskCard
+            createTaskCard
+                .padding(.horizontal, 13)
+                .padding(.top, 13)
+                .padding(.bottom, 10)
 
+            Divider().opacity(0.2)
+
+            // Keep the header and the new-task action fixed. Only this list
+            // consumes mouse-wheel events, so the panel itself never drifts.
+            ScrollView(showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 18) {
                     if taskStore.openTasks.isEmpty {
                         emptyState
                     } else {
@@ -1853,9 +2022,10 @@ struct TodoPanelView: View {
                         completedSection
                     }
                 }
-                .padding(13)
+                .padding(.horizontal, 13)
                 .padding(.bottom, 2)
             }
+            .frame(maxHeight: .infinity)
         }
     }
 
@@ -1890,7 +2060,11 @@ struct TodoPanelView: View {
 
             if showsWidgetControls {
                 Button {
-                    widget.setExpanded(false)
+                    if let panelID {
+                        widget.setExpanded(false, for: panelID)
+                    } else {
+                        widget.setExpanded(false)
+                    }
                 } label: {
                     Image(systemName: "chevron.down.circle")
                         .font(.system(size: 12, weight: .semibold))
@@ -2071,29 +2245,42 @@ struct TaskComposerSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                Button(t("取消", "Cancel")) { onCancel() }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(t("新建待办", "New task"))
+                        .font(.system(size: 18, weight: .bold, design: .rounded))
+                    Text(t("三步安排好一件要做的事", "Shape one task in three quick steps"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
 
                 Spacer()
 
-                Text(t("新建待办", "New task"))
-                    .font(.system(size: 15, weight: .bold, design: .rounded))
-
-                Spacer()
-
-                Color.clear.frame(width: 28, height: 1)
+                Button {
+                    onCancel()
+                } label: {
+                    Label(t("取消", "Cancel"), systemImage: "xmark")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 6)
+                }
+                .buttonStyle(.bordered)
+                .tint(.secondary)
+                .help(t("放弃新建", "Discard new task"))
             }
 
             stepIndicator
-            stepContent
 
-            HStack {
+            stepContent
+                .frame(maxHeight: .infinity, alignment: .top)
+
+            HStack(spacing: 10) {
                 if step > 1 {
-                    Button(t("上一步", "Back")) {
+                    Button {
                         withAnimation(.snappy(duration: 0.2)) { step -= 1 }
+                    } label: {
+                        Label(t("上一步", "Back"), systemImage: "chevron.left")
                     }
                     .buttonStyle(.bordered)
                     .tint(.secondary)
@@ -2101,21 +2288,27 @@ struct TaskComposerSheet: View {
 
                 Spacer()
 
-                Button(step == 3 ? t("创建待办", "Create task") : t("下一步", "Next")) {
+                Button {
                     if step == 3 {
                         onCreate(title.trimmingCharacters(in: .whitespacesAndNewlines), priority, selectedDueDate)
                     } else {
                         withAnimation(.snappy(duration: 0.2)) { step += 1 }
                     }
+                } label: {
+                    Label(
+                        step == 3 ? t("创建待办", "Create task") : t("下一步", "Next"),
+                        systemImage: step == 3 ? "checkmark" : "chevron.right"
+                    )
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.blue)
                 .disabled(step == 1 && !isTitleValid)
                 .keyboardShortcut(.defaultAction)
             }
+            .padding(.top, 2)
         }
-        .padding(22)
-        .frame(width: 350)
+        .padding(20)
+        .frame(width: 350, minHeight: 420, alignment: .top)
         .onAppear { titleIsFocused = true }
         .onChange(of: selectedMonth) { _ in
             selectedDay = min(selectedDay, daysInSelectedMonth)
