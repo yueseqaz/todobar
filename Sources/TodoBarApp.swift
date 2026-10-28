@@ -2308,7 +2308,8 @@ struct TaskComposerSheet: View {
             .padding(.top, 2)
         }
         .padding(20)
-        .frame(width: 350, minHeight: 420, alignment: .top)
+        .frame(width: 350)
+        .frame(minHeight: 420, alignment: .top)
         .onAppear { titleIsFocused = true }
         .onChange(of: selectedMonth) { _ in
             selectedDay = min(selectedDay, daysInSelectedMonth)
