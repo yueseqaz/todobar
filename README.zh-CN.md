@@ -4,6 +4,21 @@
 
 [English](README.md) · [v1.1.0 正式版](https://github.com/yueseqaz/todobar/releases/tag/v1.1.0) · [下载 Apple Silicon 安装包](https://github.com/yueseqaz/todobar/releases/download/v1.1.0/TodoBar-macos-arm64.zip) · [更新说明](RELEASE_NOTES.md)
 
+## 界面预览
+
+待办面板与设置窗口，使用示例事项展示深色外观。应用会跟随 Mac 的外观设置。
+
+<table>
+  <tr>
+    <th>待办面板</th>
+    <th>设置</th>
+  </tr>
+  <tr>
+    <td valign="top"><img src="docs/screenshots/tasks-zh.png" width="360" alt="TodoBar 待办面板，展示原地新建、今天的事项、后续安排和完成进度"></td>
+    <td valign="top"><img src="docs/screenshots/settings-zh.png" width="360" alt="TodoBar 设置窗口，展示提醒时间、桌面小组件和语言设置"></td>
+  </tr>
+</table>
+
 ## 下载与安装
 
 **当前正式版：v1.1.0。适用于 macOS 13 及以上的 Apple Silicon（M 系列）Mac，发布包不支持 Intel Mac。**
@@ -16,7 +31,7 @@
    ```
 
    确认输出为 `TodoBar-macos-arm64.zip: OK` 后再继续。
-3. 解压安装包，将 `TodoBar.app` 移至「应用程序」。如果旧版正在运行，请先退出，再打开新版。
+3. 解压安装包，将 `TodoBar.app` 移至「应用程序」并打开。
 4. 启动后，在菜单栏找到**清单图标**。TodoBar 不显示 Dock 图标，这是预期行为。
 
 发布包由 GitHub Actions 编译并临时签名，但**未经 Apple Developer ID 签名或 Apple 公证**。首次运行前请阅读[安装说明](INSTALL_BEFORE_USE.txt)。若被 macOS 拦截，请确认来源后按当前系统版本提供的安全提示处理，不要关闭 Gatekeeper 或运行来源不明的绕过命令。
@@ -29,7 +44,7 @@
 | 毛玻璃桌面小组件 | 收起时是紧贴屏幕侧边的小标签，展开为毛玻璃待办面板；支持左右停靠、上下拖动、按屏幕保存位置，以及仅主屏幕或所有屏幕显示。 |
 | 原地新建 | 在待办列表顶部输入内容，回车即可添加；默认中优先级、今天，可按需调整优先级和日期。未提交的草稿在收起面板或编辑其他事项后仍会保留。 |
 | 原地编辑 | 点击事项直接在条目内修改内容、优先级和日期；回车或点击别处保存并收起，空标题不会覆盖原事项。主动点到输入区外会释放焦点。 |
-| 轻量完成状态 | 已完成事项使用删除线和弱化文字；鼠标悬停或键盘聚焦时出现「完成 / 恢复」入口，不使用醒目的圆形勾选框。 |
+| 轻量完成状态 | 已完成事项使用删除线和弱化文字；鼠标悬停或键盘聚焦时出现「完成 / 恢复」入口。 |
 | 全局快速收集 | 在任意应用中按 `Option + Command + T`，打开轻量输入窗口，使用相同的内容、优先级和日期控件。 |
 | 自定义桌面提醒 | 默认每天 15:00 和 21:00 显示「今日待办清单」；在独立设置窗口添加、修改或删除时间点，自定义每天提醒次数。仅提醒当天到期且未完成的事项，无待办时不打扰。 |
 | 日期分组 | 明确区分**已推迟**、**当天待完成**与**未来待完成**。 |
@@ -57,6 +72,8 @@
 - 「今日待办清单」**仅提醒明确设置为今天到期、且尚未完成的事项**，不包含逾期或未设日期的事项；没有符合条件的待办时不弹窗。
 - 请保持 TodoBar 运行。提醒以应用自己的窗口显示，不是 macOS 通知横幅；重新打开应用或电脑唤醒后，只补提醒当天最近一个尚未处理的时间点，不连续补弹多个提醒。
 - 提醒窗口支持「30 分钟后再提醒」。
+
+<img src="docs/screenshots/reminder-zh.png" width="410" alt="今日待办清单提醒窗口，展示两条未完成的示例事项和延后 30 分钟提醒按钮">
 
 ### 本地数据
 
@@ -91,7 +108,7 @@ zsh Tests/run-widget-tests.sh
 - `TodoBar-macos-arm64.zip`
 - `SHA256SUMS.txt`
 
-维护者发布新版本时，应选择未使用过的标签，并与 `Resources/Info.plist` 中的 `CFBundleShortVersionString` 一致；工作流会检查标签与应用版本是否匹配。不要移动已有发布标签来替换构建。
+维护者发布时，应选择未使用过的标签，并与 `Resources/Info.plist` 中的 `CFBundleShortVersionString` 一致；工作流会检查标签与应用版本是否匹配。不要移动已有发布标签来替换构建。
 
 ## 项目结构
 
@@ -99,6 +116,7 @@ zsh Tests/run-widget-tests.sh
 Sources/TodoBarApp.swift       SwiftUI 应用源码
 Resources/Info.plist           应用元数据与语言声明
 Resources/TodoBar.icns         午夜蓝像素风应用图标
+docs/screenshots/             使用示例事项的应用截图
 Tests/                        回归测试
 RELEASE_NOTES.md               当前版本更新说明
 build.sh                       本地 macOS 构建脚本
@@ -109,4 +127,4 @@ build.sh                       本地 macOS 构建脚本
 
 - Dock 中没有图标是正常现象：TodoBar 是菜单栏应用。
 - 若 `Option + Command + T` 无法打开快速收集，请检查是否与其他应用的快捷键冲突。
-- 更新时先退出旧版再替换应用。应用包与本地任务文件分开存放，替换应用不会修改任务文件；有需要时可提前备份该文件。
+- 如需备份事项，可将 `~/Library/Application Support/TodoBar/tasks.json` 复制到安全位置。

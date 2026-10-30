@@ -4,6 +4,21 @@ A lightweight native macOS menu bar to-do app. Capture and edit tasks in place, 
 
 [中文](README.zh-CN.md) · [v1.1.0 release](https://github.com/yueseqaz/todobar/releases/tag/v1.1.0) · [Download for Apple Silicon](https://github.com/yueseqaz/todobar/releases/download/v1.1.0/TodoBar-macos-arm64.zip) · [Release notes](RELEASE_NOTES.md)
 
+## Screenshots
+
+The app's task panel and Settings window, shown in dark appearance with sample tasks. TodoBar follows your Mac's appearance setting.
+
+<table>
+  <tr>
+    <th>Task panel</th>
+    <th>Settings</th>
+  </tr>
+  <tr>
+    <td valign="top"><img src="docs/screenshots/tasks-en.png" width="360" alt="TodoBar task panel with inline task entry, today's tasks, upcoming tasks, and completion progress"></td>
+    <td valign="top"><img src="docs/screenshots/settings-en.png" width="360" alt="TodoBar Settings with reminder times, desktop widget options, and language preferences"></td>
+  </tr>
+</table>
+
 ## Download and install
 
 **Current release: v1.1.0. Requires an Apple Silicon (M-series) Mac running macOS 13 or later. The release package does not support Intel Macs.**
@@ -16,7 +31,7 @@ A lightweight native macOS menu bar to-do app. Capture and edit tasks in place, 
    ```
 
    Continue only if the output is `TodoBar-macos-arm64.zip: OK`.
-3. Extract the archive and move `TodoBar.app` to Applications. Quit any older running copy before opening the new one.
+3. Extract the archive, move `TodoBar.app` to Applications, and open it.
 4. Open the app and look for the **checklist icon in the menu bar**. TodoBar intentionally has no Dock icon.
 
 Release packages are built and ad-hoc signed by GitHub Actions, but are **not Apple Developer ID signed or Apple-notarized**. Read [the installation guidance](INSTALL_BEFORE_USE.txt) before first launch. If macOS blocks the app, follow the security prompts for your macOS version after confirming the source; do not disable Gatekeeper or run unknown bypass commands.
@@ -29,7 +44,7 @@ Release packages are built and ad-hoc signed by GitHub Actions, but are **not Ap
 | Glass desktop widget | A compact edge tab expands into a frosted-glass task panel. Dock it on either side, drag it vertically, and save its position per display; choose the main display or all displays in Settings. |
 | Inline creation | Add tasks at the top of the list and press Return; medium priority and today are the defaults, with optional priority and date controls. Unsent drafts survive collapsing the panel or editing another task. |
 | Inline editing | Edit content, priority, and date directly in a task row. Return or clicking elsewhere saves valid changes and closes the editor; empty titles leave the original task intact. Outside clicks release input focus. |
-| Quiet completion controls | Completed titles use strikethrough and dimmed text. Complete / Restore actions appear on hover or keyboard focus, without prominent circular checkboxes. |
+| Quiet completion controls | Completed titles use strikethrough and dimmed text. Complete / Restore actions appear on hover or keyboard focus. |
 | Global quick capture | Press `Option + Command + T` from any app to open a compact capture window with the same title, priority, and date controls. |
 | Custom daily reminders | A floating Today's to-do list shows unfinished tasks due today at 3 PM and 9 PM by default. Add, edit, or remove times in Settings to choose your daily frequency. No tasks, no interruption. |
 | Date-aware groups | See **Overdue**, **Due today**, and **Upcoming** tasks separately. |
@@ -57,6 +72,8 @@ Release packages are built and ad-hoc signed by GitHub Actions, but are **not Ap
 - The reminder shows **only unfinished tasks with a due date of today**, not overdue or undated tasks. No matching tasks means no popup.
 - Keep TodoBar running. Reminders use TodoBar's own window, not macOS notification banners. After launch or wake, only the latest unhandled time for today is caught up, not every missed time.
 - The reminder window offers a 30-minute snooze.
+
+<img src="docs/screenshots/reminder-en.png" width="410" alt="Today's to-do list reminder with two unfinished sample tasks and a 30-minute snooze button">
 
 ### Local data
 
@@ -99,6 +116,7 @@ For maintainers: use an unused tag matching `CFBundleShortVersionString` in `Res
 Sources/TodoBarApp.swift       SwiftUI application source
 Resources/Info.plist           App metadata and localization declaration
 Resources/TodoBar.icns         Midnight-blue pixel app icon
+docs/screenshots/             App screenshots with sample tasks
 Tests/                        Regression tests
 RELEASE_NOTES.md               Current release notes
 build.sh                       Local macOS build script
@@ -109,4 +127,4 @@ build.sh                       Local macOS build script
 
 - No Dock icon is expected: TodoBar is a menu-bar application.
 - If `Option + Command + T` does not open quick capture, check for another app using the same shortcut.
-- When updating, quit the running copy before replacing it. Replacing the app does not change the separate local task file; back up that file if needed.
+- To back up your tasks, copy `~/Library/Application Support/TodoBar/tasks.json` to a safe location.
