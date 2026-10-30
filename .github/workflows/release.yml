@@ -20,10 +20,22 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Run regression tests
+        run: zsh Tests/run-widget-tests.sh
+
       - name: Build TodoBar
         run: |
           chmod +x ./build.sh
           ./build.sh
+
+      - name: Verify application bundle
+        run: |
+          codesign --verify --deep --strict "dist/TodoBar.app"
+          test -s "dist/TodoBar.app/Contents/Resources/TodoBar.icns"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "dist/TodoBar.app/Contents/Info.plist")
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
 
       - name: Package application
         run: |
@@ -43,6 +55,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          name: TodoBar ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
           generate_release_notes: true
           files: |
             TodoBar-macos-arm64.zip

@@ -10,11 +10,12 @@ A lightweight native macOS menu bar to-do app for capturing work before it slips
 | --- | --- |
 | Menu bar workflow | Keep the task list one click away without a Dock window. |
 | Glass desktop widget | Pin the panel to the desktop from the menu-bar panel: real-time acrylic blur, draggable and auto-snapped to the left or right screen edge; show it on the main display or on every display from Settings; the menu-bar icon toggles between expanded and collapsed; the panel header shows today's completion progress. |
-| Three-step creation | Create a task in order: content, priority, then date. |
+| Inline creation | Add tasks at the top of the list and press Return; medium priority and today are the defaults, with optional priority and date controls. Unsent drafts survive collapsing the panel or editing another task. |
+| Inline editing | Edit content, priority, and date directly in a task row. Return or clicking elsewhere saves valid changes and closes the editor; empty titles leave the original task intact. Outside clicks release input focus. |
 | Global quick capture | Press `Option + Command + T` from any app to capture a task. |
-| Evening desktop reminder | At 9 PM, TodoBar shows its own floating desktop window for unfinished tasks due today. |
+| Custom daily reminders | A floating Today's to-do list shows unfinished tasks due today at 3 PM and 9 PM by default. Add, edit, or remove times in Settings to choose your daily frequency. No tasks, no interruption. |
 | Date-aware groups | See **Overdue**, **Due today**, and **Upcoming** tasks separately. |
-| Bilingual UI | Right-click the menu-bar icon → Settings → Language to switch between Simplified Chinese and English; the right-click menu also opens the panel, toggles the desktop widget, and quits. |
+| Consolidated Settings | Right-click the menu-bar icon → Settings… to manage reminders, the desktop widget, displays, dock side, and language (Simplified Chinese / English) in one window. Changes save automatically. |
 | Local-first data | Tasks are stored locally in your Application Support directory. |
 
 ## Requirements
@@ -61,4 +62,4 @@ build.sh                       Local macOS build script
 
 ## Notes
 
-Keep TodoBar running if you want the 9 PM desktop reminder. It does not schedule macOS notification banners. If `Option + Command + T` does not open quick capture, check for another app using the same shortcut.
+Keep TodoBar running to receive desktop reminders. The default is twice daily (3 PM and 9 PM); change, add, remove, or disable reminder times in Settings. After launch or wake, only the latest unhandled reminder for today is shown, never a burst of missed reminders. It does not schedule macOS notification banners. If `Option + Command + T` does not open quick capture, check for another app using the same shortcut.

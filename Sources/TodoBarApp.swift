@@ -145,7 +145,7 @@ final class WidgetPanel: NSPanel {
 @MainActor
 final class DesktopWidgetController: NSObject, ObservableObject {
     static let expandedSize = NSSize(width: 360, height: 460)
-    static let collapsedSize = NSSize(width: 56, height: 56)
+    static let collapsedSize = NSSize(width: 30, height: 64)
 
     private static let enabledKey = "TodoBar.widget.enabled"
     private static let expandedKey = "TodoBar.widget.expanded"
@@ -170,11 +170,13 @@ final class DesktopWidgetController: NSObject, ObservableObject {
     /// 每块屏幕一个面板，key 为显示器 ID。
     private var panels: [UInt32: WidgetPanel] = [:]
     /// 逻辑位置：贴靠的侧边由设置决定，垂直方向的位置按屏幕独立保存。
-    private var side: WidgetSide
+    @Published private var side: WidgetSide
     private var yFractions: [UInt32: Double]
     private var expandedPanelIDs: Set<UInt32> = []
     private var preferredExpandedDisplayID: UInt32?
     private var draggingPanelID: UInt32?
+    private var dragStartMouseY: CGFloat = 0
+    private var dragStartOriginY: CGFloat = 0
     private var isDragging = false
     private var mirrorTimer: Timer?
     private let taskStore: TaskStore
@@ -250,6 +252,7 @@ final class DesktopWidgetController: NSObject, ObservableObject {
 
     func setEnabled(_ enabled: Bool) {
         guard isEnabled != enabled else { return }
+        finishDragging()
         isEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: Self.enabledKey)
         if enabled {
@@ -267,6 +270,7 @@ final class DesktopWidgetController: NSObject, ObservableObject {
     /// 设置项：仅在主屏幕显示 / 每块屏幕都显示
     func setDisplayMode(_ mode: DisplayMode) {
         guard displayMode != mode else { return }
+        finishDragging()
         displayMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: Self.displayModeKey)
         guard isEnabled else { return }
@@ -301,6 +305,7 @@ final class DesktopWidgetController: NSObject, ObservableObject {
     }
 
     func setExpanded(_ expanded: Bool, for displayID: UInt32) {
+        if draggingPanelID == displayID { finishDragging() }
         if expanded {
             // Expand only the panel that was clicked. Other displays keep their
             // own state instead of being opened as a side effect.
@@ -338,7 +343,7 @@ final class DesktopWidgetController: NSObject, ObservableObject {
         }
     }
 
-    /// 菜单栏左键点按：展开 ⇄ 收纳成小图标
+    /// 菜单栏左键点按：展开 ⇄ 收纳成侧边标签
     func toggleFromStatusBar() {
         guard isEnabled else { return }
         let target = panelUnderMouse() ?? panels.values.first { $0.isVisible }
@@ -348,44 +353,40 @@ final class DesktopWidgetController: NSObject, ObservableObject {
     }
 
     func snap(to side: WidgetSide) {
+        finishDragging()
         self.side = side
         persistPosition()
         applyLayout(animated: true)
     }
 
-    /// 拖动收纳后的小图标（SwiftUI 的 y 轴向下，窗口坐标 y 轴向上）
-    func beginDragging() {
-        guard let target = panelUnderMouse(), let id = target.displayID else { return }
-        draggingPanelID = id
+    /// Use screen coordinates so moving the window cannot feed back into the gesture.
+    func beginDragging(on displayID: UInt32, at mouse: NSPoint) {
+        guard let target = panels[displayID], !isExpanded(for: displayID) else { return }
+        mirrorTimer?.invalidate()
+        draggingPanelID = displayID
+        dragStartMouseY = mouse.y
+        dragStartOriginY = target.frame.minY
         isDragging = true
     }
 
-    func moveBy(dx: CGFloat, dy: CGFloat) {
-        _ = dx
-        let target = draggingPanelID.flatMap { panels[$0] } ?? panelUnderMouse()
-        guard let target else { return }
-        if draggingPanelID == nil { draggingPanelID = target.displayID }
-        isDragging = true
-        var origin = target.frame.origin
-        // The side is controlled from Settings. Dragging only changes the
-        // vertical position, which keeps the gesture predictable and smooth.
-        origin.y += dy
-        if let screen = screenForPanel(target) {
-            origin.x = Self.frame(size: target.frame.size, side: side, y: origin.y, in: screen.visibleFrame).origin.x
-        }
-        target.setFrameOrigin(origin)
+    func drag(to mouse: NSPoint) {
+        guard isDragging,
+              let target = draggingPanelID.flatMap({ panels[$0] }),
+              let screen = screenForPanel(target) else { return }
+        let y = dragStartOriginY + mouse.y - dragStartMouseY
+        let frame = Self.collapsedFrame(side: side, y: y, screenFrame: screen.frame, visibleFrame: screen.visibleFrame)
+        target.setFrameOrigin(frame.origin)
     }
 
     func finishDragging() {
-        let target = draggingPanelID.flatMap { panels[$0] } ?? panelUnderMouse()
-        guard let target else { return }
+        guard isDragging else { return }
         mirrorTimer?.invalidate()
+        if let target = draggingPanelID.flatMap({ panels[$0] }) {
+            recordPosition(from: target.frame, screen: screenForPanel(target))
+            target.invalidateShadow()
+        }
         isDragging = false
-        // Keep the configured side and save a separate vertical position per display.
-        recordPosition(from: target.frame, screen: screenForPanel(target))
         draggingPanelID = nil
-        applyLayout(animated: false)
-        panels.values.forEach { $0.invalidateShadow() }
         persistPosition()
     }
 
@@ -413,6 +414,7 @@ final class DesktopWidgetController: NSObject, ObservableObject {
     }
 
     private func applyLayout(animated: Bool) {
+        guard !isDragging else { return }
         for (_, panel) in panels {
             guard let screen = screenForPanel(panel) else { continue }
             let expanded = panel.displayID.map { isExpanded(for: $0) } ?? isExpanded
@@ -420,7 +422,10 @@ final class DesktopWidgetController: NSObject, ObservableObject {
             let visible = screen.visibleFrame
             let fraction = yFractions[panel.displayID ?? 0] ?? yFractions[0] ?? 1
             let y = visible.minY + CGFloat(fraction) * max(visible.height - size.height, 0)
-            let target = Self.frame(size: size, side: side, y: y, in: visible)
+            let target = expanded
+                ? Self.frame(size: size, side: side, y: y, in: visible)
+                : Self.collapsedFrame(side: side, y: y, screenFrame: screen.frame, visibleFrame: visible)
+            panel.hasShadow = expanded
             if abs(panel.frame.origin.x - target.origin.x) > 0.5
                 || abs(panel.frame.origin.y - target.origin.y) > 0.5
                 || abs(panel.frame.width - target.width) > 0.5
@@ -443,7 +448,7 @@ final class DesktopWidgetController: NSObject, ObservableObject {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         // Keep the expanded panel anchored to the configured edge. The
-        // collapsed badge provides the dedicated vertical drag gesture.
+        // collapsed edge tab provides the dedicated vertical drag gesture.
         panel.isMovableByWindowBackground = false
         panel.hidesOnDeactivate = false
         panel.level = .floating
@@ -519,6 +524,7 @@ final class DesktopWidgetController: NSObject, ObservableObject {
 
     @objc private func screensChanged() {
         guard isEnabled else { return }
+        finishDragging()
         rebuildPanels()
         applyLayout(animated: false)
         panels.values.forEach { $0.orderFrontRegardless() }
@@ -537,6 +543,13 @@ final class DesktopWidgetController: NSObject, ObservableObject {
         let x = side == .left ? visible.minX + margin : visible.maxX - margin - size.width
         let clampedY = min(max(y, visible.minY + margin), visible.maxY - margin - size.height)
         return NSRect(origin: CGPoint(x: x, y: clampedY), size: size)
+    }
+
+    static func collapsedFrame(side: WidgetSide, y: CGFloat, screenFrame: NSRect, visibleFrame: NSRect) -> NSRect {
+        var result = frame(size: collapsedSize, side: side, y: y, in: visibleFrame)
+        // Dock placement must not leave a gap between the tab and the physical screen edge.
+        result.origin.x = side == .left ? screenFrame.minX : screenFrame.maxX - collapsedSize.width
+        return result
     }
 }
 
@@ -599,7 +612,7 @@ struct DesktopWidgetRootView: View {
 
     @ViewBuilder
     private var widgetContextMenu: some View {
-        Button(controller.isExpanded(for: panelID) ? t("收纳为小图标", "Collapse to icon") : t("展开面板", "Expand panel")) {
+        Button(controller.isExpanded(for: panelID) ? t("收纳为侧边标签", "Collapse to edge tab") : t("展开面板", "Expand panel")) {
             controller.setExpanded(!controller.isExpanded(for: panelID), for: panelID)
         }
 
@@ -622,82 +635,148 @@ struct DesktopWidgetRootView: View {
     }
 }
 
-/// 收纳后的常驻小图标：点击展开，按住拖动换位置
+/// 收纳后的贴边标签：点击展开，按住拖动换位置
 struct WidgetCollapsedBadge: View {
     @ObservedObject var controller: DesktopWidgetController
     let panelID: UInt32
     @EnvironmentObject private var taskStore: TaskStore
     @ObservedObject private var languageSettings = LanguageSettings.shared
-    @State private var dragTranslation: CGSize = .zero
-    @State private var dragStarted = false
+    @State private var isHovering = false
 
     var body: some View {
+        let shape = WidgetEdgeTabShape(side: controller.currentSide)
         ZStack {
-            GlassEffectView(cornerRadius: 28)
-                .clipShape(Circle())
-
-            Circle()
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [Color.white.opacity(0.45), Color.white.opacity(0.1)],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    ),
-                    lineWidth: 1
-                )
+            GlassEffectView()
+            Color.primary.opacity(isHovering ? 0.08 : 0.025)
 
             if taskStore.remainingCount == 0 {
                 Image(systemName: "checkmark")
-                    .font(.system(size: 20, weight: .bold))
-                    .foregroundStyle(
-                        LinearGradient(colors: [.cyan, .blue], startPoint: .topLeading, endPoint: .bottomTrailing)
-                    )
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.secondary)
             } else {
-                VStack(spacing: 1) {
+                VStack(spacing: 5) {
                     Image(systemName: "checklist")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(
-                            LinearGradient(colors: [.cyan, .blue], startPoint: .topLeading, endPoint: .bottomTrailing)
-                        )
-                    Text("\(taskStore.remainingCount)")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text(taskStore.remainingCount > 99 ? "99+" : "\(taskStore.remainingCount)")
                         .font(.system(size: 10, weight: .bold, design: .rounded))
                         .foregroundStyle(.primary.opacity(0.75))
                         .monospacedDigit()
                 }
             }
         }
-        .frame(width: 56, height: 56)
-        .onTapGesture {
-            guard !dragStarted else { return }
-            controller.setExpanded(true, for: panelID)
+        .frame(width: DesktopWidgetController.collapsedSize.width, height: DesktopWidgetController.collapsedSize.height)
+        .clipShape(shape)
+        .overlay {
+            shape.strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
         }
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 3)
-                .onChanged { value in
-                    if !dragStarted {
-                        dragStarted = true
-                        controller.beginDragging()
-                    }
-                    let delta = CGSize(
-                        width: value.translation.width - dragTranslation.width,
-                        height: value.translation.height - dragTranslation.height
-                    )
-                    dragTranslation = value.translation
-                    controller.moveBy(dx: delta.width, dy: -delta.height)
-                }
-                .onEnded { _ in
-                    dragTranslation = .zero
-                    controller.finishDragging()
-                    // Let a pending tap gesture observe that this was a drag.
-                    DispatchQueue.main.async { dragStarted = false }
-                }
-        )
+        .overlay {
+            WidgetEdgeTabInteraction(controller: controller, panelID: panelID)
+                .clipShape(shape)
+        }
+        .animation(.easeInOut(duration: 0.15), value: isHovering)
+        .onHover { isHovering = $0 }
         .help(t("点击展开 TodoBar，上下拖动调整位置", "Click to expand TodoBar; drag vertically to reposition"))
-        .accessibilityLabel(t("TodoBar 桌面小组件", "TodoBar desktop widget"))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(t("TodoBar 侧边标签，\(taskStore.remainingCount) 项待办", "TodoBar edge tab, \(taskStore.remainingCount) tasks remaining"))
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { controller.setExpanded(true, for: panelID) }
     }
 
     private func t(_ chinese: String, _ english: String) -> String {
         languageSettings.text(chinese, english)
+    }
+}
+
+struct WidgetEdgeTabShape: InsettableShape {
+    let side: WidgetSide
+    var insetAmount: CGFloat = 0
+
+    func path(in rect: CGRect) -> Path {
+        let rect = rect.insetBy(dx: insetAmount, dy: insetAmount)
+        let radius = max(0, min(12 - insetAmount, rect.width / 2, rect.height / 2))
+        let leftRadius: CGFloat = side == .right ? radius : 0
+        let rightRadius: CGFloat = side == .left ? radius : 0
+        return Path { path in
+            path.move(to: CGPoint(x: rect.minX + leftRadius, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.maxX - rightRadius, y: rect.minY))
+            path.addQuadCurve(to: CGPoint(x: rect.maxX, y: rect.minY + rightRadius), control: CGPoint(x: rect.maxX, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - rightRadius))
+            path.addQuadCurve(to: CGPoint(x: rect.maxX - rightRadius, y: rect.maxY), control: CGPoint(x: rect.maxX, y: rect.maxY))
+            path.addLine(to: CGPoint(x: rect.minX + leftRadius, y: rect.maxY))
+            path.addQuadCurve(to: CGPoint(x: rect.minX, y: rect.maxY - leftRadius), control: CGPoint(x: rect.minX, y: rect.maxY))
+            path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + leftRadius))
+            path.addQuadCurve(to: CGPoint(x: rect.minX + leftRadius, y: rect.minY), control: CGPoint(x: rect.minX, y: rect.minY))
+            path.closeSubpath()
+        }
+    }
+
+    func inset(by amount: CGFloat) -> WidgetEdgeTabShape {
+        var shape = self
+        shape.insetAmount += amount
+        return shape
+    }
+}
+
+private struct WidgetEdgeTabInteraction: NSViewRepresentable {
+    let controller: DesktopWidgetController
+    let panelID: UInt32
+
+    func makeNSView(context: Context) -> WidgetEdgeTabMouseView {
+        let view = WidgetEdgeTabMouseView()
+        updateNSView(view, context: context)
+        return view
+    }
+
+    func updateNSView(_ view: WidgetEdgeTabMouseView, context: Context) {
+        view.onDragBegan = { [weak controller] mouse in controller?.beginDragging(on: panelID, at: mouse) }
+        view.onDragChanged = { [weak controller] mouse in controller?.drag(to: mouse) }
+        view.onDragEnded = { [weak controller] in controller?.finishDragging() }
+        view.onClick = { [weak controller] in controller?.setExpanded(true, for: panelID) }
+    }
+}
+
+private final class WidgetEdgeTabMouseView: NSView {
+    var onDragBegan: (NSPoint) -> Void = { _ in }
+    var onDragChanged: (NSPoint) -> Void = { _ in }
+    var onDragEnded: () -> Void = {}
+    var onClick: () -> Void = {}
+    private var mouseDownPoint: NSPoint?
+    private var isDragging = false
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        mouseDownPoint = screenLocation(for: event)
+        isDragging = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = mouseDownPoint else { return }
+        let mouse = screenLocation(for: event)
+        if !isDragging {
+            guard hypot(mouse.x - start.x, mouse.y - start.y) >= 3 else { return }
+            isDragging = true
+            onDragBegan(start)
+        }
+        onDragChanged(mouse)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard mouseDownPoint != nil else { return }
+        let wasDragging = isDragging
+        mouseDownPoint = nil
+        isDragging = false
+        if wasDragging {
+            onDragChanged(screenLocation(for: event))
+            onDragEnded()
+        } else {
+            onClick()
+        }
+    }
+
+    private func screenLocation(for event: NSEvent) -> NSPoint {
+        window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
     }
 }
 
@@ -720,6 +799,434 @@ final class TodoBarMain: NSObject, NSApplicationDelegate {
     }
 }
 
+struct ReminderTime: Codable, Equatable, Identifiable {
+    let id: UUID
+    var minuteOfDay: Int
+
+    init(id: UUID = UUID(), minuteOfDay: Int) {
+        self.id = id
+        self.minuteOfDay = minuteOfDay
+    }
+
+    func date(on day: Date = Date(), calendar: Calendar = .current) -> Date {
+        calendar.date(bySettingHour: minuteOfDay / 60, minute: minuteOfDay % 60, second: 0, of: day) ?? day
+    }
+}
+
+final class ReminderSettings: ObservableObject {
+    private let defaults: UserDefaults
+    private static let timesKey = "TodoBar.reminders.times"
+    private static let enabledKey = "TodoBar.reminders.enabled"
+
+    @Published var isEnabled: Bool {
+        didSet { defaults.set(isEnabled, forKey: Self.enabledKey) }
+    }
+    @Published private(set) var times: [ReminderTime]
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        isEnabled = defaults.object(forKey: Self.enabledKey) as? Bool ?? true
+        let saved = defaults.data(forKey: Self.timesKey)
+            .flatMap { try? JSONDecoder().decode([ReminderTime].self, from: $0) } ?? []
+        var minutes = Set<Int>()
+        var ids = Set<UUID>()
+        let valid = saved.filter {
+            (0..<1440).contains($0.minuteOfDay) && minutes.insert($0.minuteOfDay).inserted && ids.insert($0.id).inserted
+        }.sorted { $0.minuteOfDay < $1.minuteOfDay }
+        times = valid.isEmpty ? [ReminderTime(minuteOfDay: 900), ReminderTime(minuteOfDay: 1260)] : valid
+    }
+
+    @discardableResult
+    func update(id: UUID, minuteOfDay: Int) -> Bool {
+        guard (0..<1440).contains(minuteOfDay),
+              let index = times.firstIndex(where: { $0.id == id }),
+              !times.contains(where: { $0.id != id && $0.minuteOfDay == minuteOfDay }) else { return false }
+        var updated = times
+        updated[index].minuteOfDay = minuteOfDay
+        save(updated)
+        return true
+    }
+
+    func addTime() {
+        let used = Set(times.map(\.minuteOfDay))
+        let start = ((times.last?.minuteOfDay ?? 840) + 60) % 1440
+        guard let minute = (0..<1440).map({ (start + $0) % 1440 }).first(where: { !used.contains($0) }) else { return }
+        save(times + [ReminderTime(minuteOfDay: minute)])
+    }
+
+    func remove(id: UUID) {
+        guard times.count > 1 else { return }
+        save(times.filter { $0.id != id })
+    }
+
+    private func save(_ updated: [ReminderTime]) {
+        times = updated.sorted { $0.minuteOfDay < $1.minuteOfDay }
+        if let data = try? JSONEncoder().encode(times) {
+            defaults.set(data, forKey: Self.timesKey)
+        }
+    }
+}
+
+enum ReminderSchedule {
+    static func dueTimes(_ times: [ReminderTime], at now: Date, calendar: Calendar = .current) -> [ReminderTime] {
+        times.filter { $0.date(on: now, calendar: calendar) <= now }
+            .sorted { $0.minuteOfDay < $1.minuteOfDay }
+    }
+
+    static func nextDate(_ times: [ReminderTime], after now: Date, calendar: Calendar = .current) -> Date? {
+        times.compactMap { time in
+            calendar.nextDate(
+                after: now,
+                matching: DateComponents(hour: time.minuteOfDay / 60, minute: time.minuteOfDay % 60, second: 0),
+                matchingPolicy: .nextTime,
+                repeatedTimePolicy: .first
+            )
+        }.min()
+    }
+
+    static func dayKey(at now: Date, calendar: Calendar = .current) -> String {
+        let parts = calendar.dateComponents([.era, .year, .month, .day], from: now)
+        return "\(parts.era ?? 0)-\(parts.year ?? 0)-\(parts.month ?? 0)-\(parts.day ?? 0)"
+    }
+}
+
+@MainActor
+final class SettingsWindowController {
+    private let widget: DesktopWidgetController
+    private let reminders: ReminderSettings
+    private var window: NSWindow?
+
+    init(widget: DesktopWidgetController, reminders: ReminderSettings) {
+        self.widget = widget
+        self.reminders = reminders
+    }
+
+    func show() {
+        if window == nil {
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 480, height: 700),
+                styleMask: [.titled, .closable, .miniaturizable],
+                backing: .buffered, defer: false
+            )
+            window.title = "TodoBar"
+            window.titlebarAppearsTransparent = true
+            window.isReleasedWhenClosed = false
+            window.contentView = NSHostingView(rootView: TodoBarSettingsView(widget: widget, reminders: reminders))
+            window.center()
+            self.window = window
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+}
+
+private struct BlueSwitchStyle: ToggleStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        Button { configuration.isOn.toggle() } label: {
+            ZStack {
+                Capsule().fill(configuration.isOn ? Color.blue : Color.primary.opacity(0.18))
+                Circle().fill(.white)
+                    .frame(width: 16, height: 16)
+                    .shadow(color: .black.opacity(0.12), radius: 1, y: 1)
+                    .offset(x: configuration.isOn ? 8 : -8)
+            }
+            .frame(width: 36, height: 20)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.15), value: configuration.isOn)
+        .accessibilityRepresentation {
+            Toggle(isOn: configuration.$isOn) { configuration.label }.toggleStyle(.switch)
+        }
+    }
+}
+
+private final class ReminderTimeSegmentField: NSTextField {
+    override func mouseDown(with event: NSEvent) {
+        super.mouseDown(with: event)
+        selectText(nil)
+    }
+}
+
+/// Separate editable segments give predictable HH -> mm keyboard navigation.
+final class ReminderTimeControl: NSView, NSTextFieldDelegate {
+    let hourField: NSTextField = ReminderTimeSegmentField()
+    let minuteField: NSTextField = ReminderTimeSegmentField()
+    private(set) var minuteOfDay = 0
+    var onChange: (Int) -> Bool = { _ in true }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        for field in [hourField, minuteField] {
+            field.isBordered = false
+            field.drawsBackground = false
+            field.focusRingType = .none
+            field.alignment = .center
+            field.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+            field.delegate = self
+            addSubview(field)
+        }
+        hourField.frame = NSRect(x: 7, y: 4, width: 25, height: 18)
+        minuteField.frame = NSRect(x: 40, y: 4, width: 25, height: 18)
+        hourField.nextKeyView = minuteField
+        displayValue()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: 72, height: 26) }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 7, yRadius: 7)
+        NSColor.controlBackgroundColor.setFill()
+        path.fill()
+        NSColor.separatorColor.setStroke()
+        path.lineWidth = 1
+        path.stroke()
+        (":" as NSString).draw(at: NSPoint(x: 33, y: 5), withAttributes: [
+            .font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.labelColor
+        ])
+    }
+
+    func update(minuteOfDay: Int, isEnabled: Bool) {
+        hourField.isEnabled = isEnabled
+        minuteField.isEnabled = isEnabled
+        // SwiftUI updates must not overwrite a partially entered segment.
+        guard hourField.currentEditor() == nil && minuteField.currentEditor() == nil else { return }
+        self.minuteOfDay = minuteOfDay
+        displayValue()
+    }
+
+    func controlTextDidBeginEditing(_ notification: Notification) {
+        (notification.object as? NSTextField)?.currentEditor()?.selectAll(nil)
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField else { return }
+        let digits = String(field.stringValue.filter { $0 >= "0" && $0 <= "9" }.prefix(2))
+        if field.stringValue != digits { field.stringValue = digits }
+        guard digits.count == 2, let number = Int(digits) else { return }
+        if field === hourField && number < 24 {
+            window?.makeFirstResponder(minuteField)
+            minuteField.selectText(nil)
+        } else if field === minuteField && number < 60 {
+            commit()
+        }
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        // Moving between segments is not a submission of the intermediate time.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.hourField.currentEditor() == nil && self.minuteField.currentEditor() == nil else { return }
+            self.commit()
+        }
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            commit()
+            window?.makeFirstResponder(nil)
+            return true
+        }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            displayValue()
+            window?.makeFirstResponder(nil)
+            return true
+        }
+        return false
+    }
+
+    private func commit() {
+        guard let hour = Int(hourField.stringValue), (0..<24).contains(hour),
+              let minute = Int(minuteField.stringValue), (0..<60).contains(minute) else {
+            displayValue()
+            return
+        }
+        let value = hour * 60 + minute
+        if value != minuteOfDay && onChange(value) { minuteOfDay = value }
+        displayValue()
+    }
+
+    private func displayValue() {
+        hourField.stringValue = String(format: "%02d", minuteOfDay / 60)
+        minuteField.stringValue = String(format: "%02d", minuteOfDay % 60)
+    }
+}
+
+struct ReminderTimeInput: NSViewRepresentable {
+    let minuteOfDay: Int
+    let onChange: (Int) -> Bool
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeNSView(context: Context) -> ReminderTimeControl { ReminderTimeControl(frame: .zero) }
+
+    func updateNSView(_ view: ReminderTimeControl, context: Context) {
+        view.onChange = onChange
+        view.hourField.setAccessibilityLabel(LanguageSettings.shared.text("提醒小时，24 小时制", "Reminder hour, 24-hour time"))
+        view.minuteField.setAccessibilityLabel(LanguageSettings.shared.text("提醒分钟", "Reminder minute"))
+        view.update(minuteOfDay: minuteOfDay, isEnabled: isEnabled)
+    }
+}
+
+struct TodoBarSettingsView: View {
+    @ObservedObject var widget: DesktopWidgetController
+    @ObservedObject var reminders: ReminderSettings
+    @ObservedObject private var language = LanguageSettings.shared
+    @State private var duplicateTime = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(t("设置", "Settings"))
+                        .font(.system(size: 25, weight: .bold, design: .rounded))
+                    Text(t("按你的节奏，安排每一天。", "Make room for your daily rhythm."))
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                }
+
+                section(t("待办提醒", "Daily reminders")) {
+                    VStack(spacing: 0) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(t("今日待办清单", "Today's to-do list")).fontWeight(.medium)
+                                Text(reminders.isEnabled
+                                     ? t("每天提醒 \(reminders.times.count) 次", "\(reminders.times.count) reminders per day")
+                                     : t("已暂停提醒，时间设置会保留", "Paused. Your times are saved."))
+                                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Toggle(t("开启提醒", "Enable reminders"), isOn: $reminders.isEnabled)
+                                .labelsHidden().toggleStyle(BlueSwitchStyle())
+                        }
+                        .padding(14)
+                        Divider().padding(.horizontal, 14)
+                        VStack(spacing: 9) {
+                            ForEach(Array(reminders.times.enumerated()), id: \.element.id) { index, time in
+                                HStack {
+                                    Text(t("第 \(index + 1) 次", "Reminder \(index + 1)"))
+                                        .foregroundStyle(.secondary)
+                                    Spacer()
+                                    ReminderTimeInput(minuteOfDay: time.minuteOfDay) { minute in
+                                        let accepted = reminders.update(id: time.id, minuteOfDay: minute)
+                                        duplicateTime = !accepted
+                                        return accepted
+                                    }
+                                    .frame(width: 72, height: 26)
+                                    Button { reminders.remove(id: time.id) } label: {
+                                        Image(systemName: "minus").font(.system(size: 11, weight: .medium))
+                                            .frame(width: 26, height: 26).contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain).foregroundStyle(.secondary)
+                                    .disabled(reminders.times.count == 1)
+                                    .help(t("移除此时间", "Remove this time"))
+                                    .accessibilityLabel(t("移除此提醒时间", "Remove reminder time"))
+                                }
+                            }
+                            HStack {
+                                Button { reminders.addTime() } label: {
+                                    Label(t("添加提醒时间", "Add reminder time"), systemImage: "plus")
+                                        .font(.system(size: 11, weight: .medium))
+                                        .padding(.horizontal, 10).padding(.vertical, 7)
+                                        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+                                }
+                                .buttonStyle(.plain).disabled(reminders.times.count == 1440)
+                                Spacer()
+                            }
+                            .padding(.top, 3)
+                        }
+                        .padding(14)
+                        .disabled(!reminders.isEnabled)
+                        .opacity(reminders.isEnabled ? 1 : 0.45)
+                    }
+                }
+                Text(t("仅提醒今天到期且未完成的事项；没有待办时不打扰。请保持 TodoBar 运行。", "Only unfinished tasks due today appear. No tasks, no interruption. Keep TodoBar running."))
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .padding(.top, -14)
+
+                section(t("桌面小组件", "Desktop widget")) {
+                    VStack(spacing: 14) {
+                        HStack {
+                            Text(t("常驻桌面", "Pin to desktop"))
+                            Spacer()
+                            Toggle(t("常驻桌面", "Pin to desktop"), isOn: Binding(get: { widget.isEnabled }, set: { widget.setEnabled($0) }))
+                                .labelsHidden().toggleStyle(BlueSwitchStyle())
+                        }
+                        Divider()
+                        HStack {
+                            Text(t("显示屏幕", "Displays"))
+                            Spacer()
+                            Picker(t("显示屏幕", "Displays"), selection: Binding(get: { widget.displayMode }, set: { widget.setDisplayMode($0) })) {
+                                Text(t("仅主屏幕", "Main display")).tag(DesktopWidgetController.DisplayMode.mainDisplay)
+                                Text(t("所有屏幕", "All displays")).tag(DesktopWidgetController.DisplayMode.allDisplays)
+                            }
+                            .labelsHidden().frame(width: 165)
+                        }
+                        .disabled(!widget.isEnabled)
+                        HStack {
+                            Text(t("停靠侧边", "Dock side"))
+                            Spacer()
+                            Picker(t("停靠侧边", "Dock side"), selection: Binding(get: { widget.currentSide }, set: { widget.snap(to: $0) })) {
+                                Text(t("左侧", "Left")).tag(WidgetSide.left)
+                                Text(t("右侧", "Right")).tag(WidgetSide.right)
+                            }
+                            .labelsHidden().pickerStyle(.segmented).frame(width: 165)
+                        }
+                        .disabled(!widget.isEnabled)
+                    }
+                    .padding(14)
+                }
+
+                section(t("通用", "General")) {
+                    VStack(spacing: 14) {
+                        HStack {
+                            Text(t("界面语言", "Language"))
+                            Spacer()
+                            Picker(t("界面语言", "Language"), selection: $language.language) {
+                                ForEach(AppLanguage.allCases) { Text($0.displayName).tag($0) }
+                            }
+                            .labelsHidden().frame(width: 165)
+                        }
+                        Divider()
+                        HStack {
+                            Text(t("快速新建", "Quick capture"))
+                            Spacer()
+                            Text("⌥ ⌘ T").foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(14)
+                }
+                Text(t("所有更改自动保存", "Changes are saved automatically"))
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+            }
+            .font(.system(size: 12))
+            .padding(24)
+        }
+        .frame(width: 480, height: 700)
+        .background { GlassEffectView(material: .sidebar) }
+        .tint(.primary)
+        .environment(\.locale, language.language.locale)
+        .alert(t("这个时间已存在", "Time already added"), isPresented: $duplicateTime) {
+            Button(t("知道了", "Got it"), role: .cancel) {}
+        } message: {
+            Text(t("请选择另一个时间，同一时间只提醒一次。", "Choose another time. Each time only needs one reminder."))
+        }
+    }
+
+    private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text(title).font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+            content()
+                .frame(maxWidth: .infinity)
+                .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 11))
+                .overlay { RoundedRectangle(cornerRadius: 11).strokeBorder(Color.primary.opacity(0.03), lineWidth: 1) }
+        }
+    }
+
+    private func t(_ chinese: String, _ english: String) -> String { language.text(chinese, english) }
+}
+
 @MainActor
 final class TodoBarModel: ObservableObject {
     let taskStore: TaskStore
@@ -729,10 +1236,11 @@ final class TodoBarModel: ObservableObject {
 
     init() {
         let store = TaskStore()
+        let reminders = ReminderSettings()
         self.taskStore = store
         self.widgetController = DesktopWidgetController(taskStore: store)
-        self.statusBarController = StatusBarController(taskStore: store, widgetController: widgetController)
-        self.services = TodoBarServices()
+        self.statusBarController = StatusBarController(taskStore: store, widgetController: widgetController, reminders: reminders)
+        self.services = TodoBarServices(reminders: reminders)
         self.services.configure(with: store)
 
         DispatchQueue.main.async { [weak self] in
@@ -747,19 +1255,20 @@ final class TodoBarModel: ObservableObject {
 final class StatusBarController: NSObject, NSMenuDelegate {
     private let taskStore: TaskStore
     private let widgetController: DesktopWidgetController
+    private let settingsController: SettingsWindowController
 
     private var statusItem: NSStatusItem?
     private var panel: WidgetPanel?
     private var aboutPanel: WidgetPanel?
     private var eventMonitors: [Any] = []
-    private var iconSubscription: AnyCancellable?
     private var widgetSubscription: AnyCancellable?
     private let contextMenu = NSMenu()
     private var isShowingContextMenu = false
 
-    init(taskStore: TaskStore, widgetController: DesktopWidgetController) {
+    init(taskStore: TaskStore, widgetController: DesktopWidgetController, reminders: ReminderSettings) {
         self.taskStore = taskStore
         self.widgetController = widgetController
+        self.settingsController = SettingsWindowController(widget: widgetController, reminders: reminders)
         super.init()
     }
 
@@ -775,12 +1284,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         }
 
         contextMenu.delegate = self
-        updateIcon(remaining: taskStore.remainingCount)
-
-        iconSubscription = taskStore.$tasks.receive(on: DispatchQueue.main).sink { [weak self] tasks in
-            let remaining = tasks.lazy.filter { !$0.isCompleted }.count
-            self?.updateIcon(remaining: remaining)
-        }
+        configureIcon()
 
         // 小组件开启时收起菜单面板，避免出现两个待办面板
         widgetSubscription = widgetController.$isEnabled.receive(on: DispatchQueue.main).sink { [weak self] enabled in
@@ -790,14 +1294,15 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    private func updateIcon(remaining: Int) {
+    private func configureIcon() {
         guard let button = statusItem?.button else { return }
-        button.image = NSImage(
-            systemSymbolName: remaining == 0 ? "checkmark.circle.fill" : "checkmark.circle",
-            accessibilityDescription: remaining == 0 ? t("全部完成", "All done") : t("剩余任务", "Tasks remaining")
-        )
-        button.title = remaining > 0 ? " \(remaining)" : ""
-        button.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+        let image = NSImage(systemSymbolName: "checklist", accessibilityDescription: "TodoBar")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 17, weight: .medium))
+        image?.isTemplate = true
+        button.image = image
+        button.title = ""
+        button.imagePosition = .imageOnly
+        button.toolTip = "TodoBar"
     }
 
     @objc private func handleStatusItemClick() {
@@ -955,6 +1460,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
         for visiblePanel in [panel, aboutPanel].compactMap({ $0 }) where visiblePanel.isVisible {
             if visiblePanel.frame.contains(mouse) { continue }
+            if InlineInteractionSession.containsPopupClick(for: visiblePanel, at: mouse) { continue }
             if let itemFrame, itemFrame.contains(mouse) { continue }
             visiblePanel.orderOut(nil)
         }
@@ -980,75 +1486,12 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
         contextMenu.addItem(.separator())
 
-        let settingsItem = NSMenuItem(title: t("设置", "Settings"), action: nil, keyEquivalent: "")
-        let settingsMenu = NSMenu(title: t("设置", "Settings"))
-
-        let languageItem = NSMenuItem(title: t("语言", "Language"), action: nil, keyEquivalent: "")
-        let languageMenu = NSMenu(title: t("语言", "Language"))
-        for language in AppLanguage.allCases {
-            let item = NSMenuItem(
-                title: language.displayName,
-                action: #selector(selectLanguage(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = language.rawValue
-            item.state = language == LanguageSettings.shared.language ? .on : .off
-            languageMenu.addItem(item)
-        }
-        languageItem.submenu = languageMenu
-        settingsMenu.addItem(languageItem)
-
-        let widgetToggle = NSMenuItem(
-            title: t("桌面常驻小组件", "Pin to desktop"),
-            action: #selector(toggleWidgetFromMenu),
-            keyEquivalent: ""
+        let settingsItem = NSMenuItem(
+            title: t("设置…", "Settings…"),
+            action: #selector(showSettings),
+            keyEquivalent: ","
         )
-        widgetToggle.target = self
-        widgetToggle.state = widgetController.isEnabled ? .on : .off
-        settingsMenu.addItem(widgetToggle)
-
-        let displayItem = NSMenuItem(title: t("显示屏幕", "Displays"), action: nil, keyEquivalent: "")
-        let displayMenu = NSMenu(title: t("显示屏幕", "Displays"))
-        let displayModes: [(DesktopWidgetController.DisplayMode, String, String)] = [
-            (.mainDisplay, "仅主屏幕", "Main display only"),
-            (.allDisplays, "所有屏幕", "All displays")
-        ]
-        for (mode, chinese, english) in displayModes {
-            let item = NSMenuItem(
-                title: t(chinese, english),
-                action: #selector(selectDisplayMode(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = mode.rawValue
-            item.state = widgetController.displayMode == mode ? .on : .off
-            displayMenu.addItem(item)
-        }
-        displayItem.submenu = displayMenu
-        settingsMenu.addItem(displayItem)
-
-        let sideItem = NSMenuItem(title: t("停靠侧边", "Dock side"), action: nil, keyEquivalent: "")
-        let sideMenu = NSMenu(title: t("停靠侧边", "Dock side"))
-        let sideModes: [(WidgetSide, String, String)] = [
-            (.left, "屏幕左侧", "Left edge"),
-            (.right, "屏幕右侧", "Right edge")
-        ]
-        for (side, chinese, english) in sideModes {
-            let item = NSMenuItem(
-                title: t(chinese, english),
-                action: #selector(selectWidgetSide(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = side.rawValue
-            item.state = widgetController.currentSide == side ? .on : .off
-            sideMenu.addItem(item)
-        }
-        sideItem.submenu = sideMenu
-        settingsMenu.addItem(sideItem)
-
-        settingsItem.submenu = settingsMenu
+        settingsItem.target = self
         contextMenu.addItem(settingsItem)
 
         contextMenu.addItem(.separator())
@@ -1089,26 +1532,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         installMonitorsIfNeeded()
     }
 
-    @objc private func toggleWidgetFromMenu() {
-        widgetController.toggleEnabled()
-    }
-
-    @objc private func selectDisplayMode(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String,
-              let mode = DesktopWidgetController.DisplayMode(rawValue: raw) else { return }
-        widgetController.setDisplayMode(mode)
-    }
-
-    @objc private func selectWidgetSide(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String,
-              let side = WidgetSide(rawValue: raw) else { return }
-        widgetController.snap(to: side)
-    }
-
-    @objc private func selectLanguage(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String,
-              let language = AppLanguage(rawValue: raw) else { return }
-        LanguageSettings.shared.language = language
+    @objc private func showSettings() {
+        hidePanel()
+        settingsController.show()
     }
 
     @objc private func quitApp() {
@@ -1208,7 +1634,11 @@ final class TodoBarServices {
     private weak var taskStore: TaskStore?
     private let hotKeyManager = GlobalHotKeyManager()
     private let quickCaptureController = QuickCaptureController()
-    private let eveningReminderController = EveningReminderController()
+    private let eveningReminderController: EveningReminderController
+
+    init(reminders: ReminderSettings) {
+        eveningReminderController = EveningReminderController(settings: reminders)
+    }
     private var isConfigured = false
 
     func configure(with taskStore: TaskStore) {
@@ -1329,15 +1759,15 @@ final class QuickCaptureController {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         panel.backgroundColor = .clear
         panel.contentView = NSHostingView(rootView: QuickCaptureView(
-            onSave: { [weak self] title, scheduleForToday in
+            onSave: { [weak self] draft in
                 self?.taskStore?.add(
-                    title: title,
-                    priority: .medium,
-                    dueDate: scheduleForToday ? Calendar.current.startOfDay(for: Date()) : nil
+                    title: draft.trimmedTitle,
+                    priority: draft.priority,
+                    dueDate: draft.schedule.dueDate()
                 )
                 self?.dismiss()
             },
-            onCancel: { [weak self] in self?.dismiss() }
+            onDismiss: { [weak self] in self?.dismiss() }
         ))
         return panel
     }
@@ -1348,65 +1778,50 @@ final class QuickCaptureController {
 }
 
 struct QuickCaptureView: View {
-    let onSave: (String, Bool) -> Void
-    let onCancel: () -> Void
+    let onSave: (InlineTaskDraft) -> Void
+    let onDismiss: () -> Void
 
     @ObservedObject private var languageSettings = LanguageSettings.shared
-    @State private var title = ""
-    @State private var scheduleForToday = true
-    @FocusState private var titleIsFocused: Bool
-
-    private var isValid: Bool {
-        !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
+    @State private var draft = InlineTaskDraft()
+    @State private var activationID = 0
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 15) {
-            HStack {
-                Label(t("快速收集", "Quick capture"), systemImage: "text.badge.plus")
-                    .font(.system(size: 14, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.blue)
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Text(t("快速记录", "Quick capture"))
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.secondary)
                 Spacer()
                 Text("⌥⌘T")
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
             }
 
-            TextField(t("记下一件想完成的事", "Capture one thing to do"), text: $title)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 15))
-                .focused($titleIsFocused)
-                .onSubmit { save() }
-
-            HStack {
-                Toggle(t("默认安排在今天", "Schedule for today"), isOn: $scheduleForToday)
-                    .toggleStyle(.switch)
-                .font(.caption)
-                Spacer()
-                Button(t("取消", "Cancel")) { onCancel() }
-                    .buttonStyle(.bordered)
-                Button(t("加入待办", "Add task")) { save() }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.blue)
-                    .disabled(!isValid)
-                    .keyboardShortcut(.defaultAction)
-            }
+            InlineTaskInput(
+                draft: $draft,
+                showsPlus: true,
+                submitTitle: t("添加", "Add"),
+                onActivate: {},
+                onSubmit: save,
+                onEnd: onDismiss
+            )
+            .id(activationID)
         }
-        .padding(22)
+        .padding(16)
         .frame(width: 388)
-        .background(.ultraThinMaterial)
-        .onAppear { titleIsFocused = true }
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .onReceive(NotificationCenter.default.publisher(for: .todoBarQuickCaptureActivated)) { _ in
-            title = ""
-            scheduleForToday = true
-            titleIsFocused = true
+            // Re-mount only the input control so a previously typed draft survives.
+            activationID += 1
         }
     }
 
-    private func save() {
-        guard isValid else { return }
-        onSave(title.trimmingCharacters(in: .whitespacesAndNewlines), scheduleForToday)
-        title = ""
+    private func save() -> Bool {
+        guard draft.canSubmit else { return false }
+        let submitted = draft
+        draft = InlineTaskDraft()
+        onSave(submitted)
+        return false
     }
 
     private func t(_ chinese: String, _ english: String) -> String {
@@ -1429,19 +1844,81 @@ private enum LegacyNotificationCleaner {
     }
 }
 
+/// Persist delivery per local day and time, not just once per day.
+final class ReminderDeliveryHistory {
+    private let defaults: UserDefaults
+    private let key = "TodoBar.reminders.handledSlots"
+
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    @discardableResult
+    func consumeLatest(_ times: [ReminderTime], at now: Date, calendar: Calendar = .current) -> Bool {
+        let due = ReminderSchedule.dueTimes(times, at: now, calendar: calendar)
+        guard let latest = due.last else { return false }
+        let prefix = ReminderSchedule.dayKey(at: now, calendar: calendar) + ":"
+        var handled = Set((defaults.stringArray(forKey: key) ?? []).filter { $0.hasPrefix(prefix) })
+        let shouldDeliver = !handled.contains(prefix + String(latest.minuteOfDay))
+        // After sleep or launch, deliver only the latest missed slot, never a burst.
+        due.forEach { handled.insert(prefix + String($0.minuteOfDay)) }
+        defaults.set(handled.sorted(), forKey: key)
+        return shouldDeliver
+    }
+}
+
 @MainActor
 final class EveningReminderController {
     private weak var taskStore: TaskStore?
+    private let settings: ReminderSettings
+    private let history: ReminderDeliveryHistory
+    private var subscriptions = Set<AnyCancellable>()
     private var scheduleTimer: Timer?
     private var snoozeTimer: Timer?
     private var panel: NSPanel?
-    private let defaults = UserDefaults.standard
-    private let reminderDayKey = "TodoBar.eveningReminderDay"
+
+    var nextScheduledReminder: Date? {
+        scheduleTimer?.isValid == true ? scheduleTimer?.fireDate : nil
+    }
+
+    deinit {
+        scheduleTimer?.invalidate()
+        snoozeTimer?.invalidate()
+    }
+
+    init(settings: ReminderSettings, defaults: UserDefaults = .standard) {
+        self.settings = settings
+        self.history = ReminderDeliveryHistory(defaults: defaults)
+    }
 
     func configure(with taskStore: TaskStore) {
+        guard self.taskStore == nil else { return }
         self.taskStore = taskStore
-        scheduleNextCheck()
-        checkForMissedEveningReminder()
+        Publishers.CombineLatest(settings.$times, settings.$isEnabled)
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.snoozeTimer?.invalidate()
+                self.dismiss()
+                // Editing a past time does not immediately interrupt the user.
+                if self.settings.isEnabled {
+                    self.history.consumeLatest(self.settings.times, at: Date())
+                }
+                self.scheduleNextCheck()
+            }
+            .store(in: &subscriptions)
+
+        let clockEvents = [Notification.Name.NSSystemClockDidChange, .NSSystemTimeZoneDidChange, .NSCalendarDayChanged]
+        for name in clockEvents {
+            NotificationCenter.default.publisher(for: name)
+                .receive(on: RunLoop.main)
+                .sink { [weak self] _ in self?.refreshSchedule() }
+                .store(in: &subscriptions)
+        }
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.refreshSchedule() }
+            .store(in: &subscriptions)
+        refreshSchedule()
     }
 
     func handleTaskChange(_ tasks: [TodoItem]) {
@@ -1454,41 +1931,28 @@ final class EveningReminderController {
         }
     }
 
-    private func scheduleNextCheck(from now: Date = Date()) {
-        scheduleTimer?.invalidate()
-
-        let calendar = Calendar.current
-        let todayAtNine = calendar.date(bySettingHour: 21, minute: 0, second: 0, of: now) ?? now
-        let target = todayAtNine > now
-            ? todayAtNine
-            : calendar.date(byAdding: .day, value: 1, to: todayAtNine) ?? todayAtNine
-
-        scheduleTimer = Timer(fire: target, interval: 0, repeats: false) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.presentReminderIfNeeded()
-                self?.scheduleNextCheck()
-            }
-        }
-
-        if let scheduleTimer {
-            RunLoop.main.add(scheduleTimer, forMode: .common)
-        }
+    private func refreshSchedule() {
+        if let taskStore { handleTaskChange(taskStore.tasks) }
+        presentReminderIfNeeded()
+        scheduleNextCheck()
     }
 
-    private func checkForMissedEveningReminder() {
-        let calendar = Calendar.current
-        guard calendar.component(.hour, from: Date()) >= 21 else { return }
-        presentReminderIfNeeded()
+    private func scheduleNextCheck(from now: Date = Date()) {
+        scheduleTimer?.invalidate()
+        guard settings.isEnabled,
+              let target = ReminderSchedule.nextDate(settings.times, after: now) else { return }
+        scheduleTimer = Timer(fire: target, interval: 0, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshSchedule() }
+        }
+        if let scheduleTimer { RunLoop.main.add(scheduleTimer, forMode: .common) }
     }
 
     private func presentReminderIfNeeded() {
-        let dayKey = currentDayKey()
-        guard defaults.string(forKey: reminderDayKey) != dayKey else { return }
-        defaults.set(dayKey, forKey: reminderDayKey)
-
-        guard let taskStore else { return }
+        guard settings.isEnabled, let taskStore,
+              history.consumeLatest(settings.times, at: Date()) else { return }
         let tasks = dueTodayTasks(from: taskStore.tasks)
         guard !tasks.isEmpty else { return }
+        snoozeTimer?.invalidate()
         show(tasks: tasks)
     }
 
@@ -1498,12 +1962,6 @@ final class EveningReminderController {
             guard !item.isCompleted, let dueDate = item.dueDate else { return false }
             return calendar.isDate(dueDate, inSameDayAs: Date())
         }
-    }
-
-    private func currentDayKey() -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withFullDate]
-        return formatter.string(from: Date())
     }
 
     private func show(tasks: [TodoItem]) {
@@ -1548,7 +2006,7 @@ final class EveningReminderController {
         snoozeTimer?.invalidate()
         snoozeTimer = Timer.scheduledTimer(withTimeInterval: 1_800, repeats: false) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self, let taskStore = self.taskStore else { return }
+                guard let self, self.settings.isEnabled, let taskStore = self.taskStore else { return }
                 let tasks = self.dueTodayTasks(from: taskStore.tasks)
                 guard !tasks.isEmpty else { return }
                 self.show(tasks: tasks)
@@ -1569,61 +2027,88 @@ struct EveningReminderView: View {
     @ObservedObject private var languageSettings = LanguageSettings.shared
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .top) {
-                ZStack {
-                    Circle()
-                        .fill(LinearGradient(colors: [.indigo, .blue], startPoint: .topLeading, endPoint: .bottomTrailing))
-                        .frame(width: 38, height: 38)
-                    Image(systemName: "moon.stars.fill")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(.white)
-                }
-
+        VStack(alignment: .leading, spacing: 13) {
+            HStack(alignment: .firstTextBaseline, spacing: 9) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(t("晚上 9 点清单", "9 PM check-in"))
-                        .font(.system(size: 17, weight: .bold, design: .rounded))
+                    Text(t("今日待办清单", "Today’s to-do list"))
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
                     Text(t("今天还有 \(tasks.count) 件待办没有完成", "You still have \(tasks.count) tasks due today"))
-                        .font(.subheadline)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
                 Spacer()
+
+                Text("\(tasks.count)")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.primary.opacity(0.08), in: Capsule())
             }
 
             ScrollView(showsIndicators: tasks.count > 4) {
                 VStack(alignment: .leading, spacing: 7) {
                     ForEach(tasks) { task in
-                        HStack(spacing: 8) {
+                        HStack(spacing: 9) {
                             Circle()
                                 .fill(task.priority.color)
-                                .frame(width: 7, height: 7)
-                            Text(task.title)
-                                .font(.system(size: 13, weight: .medium))
-                                .lineLimit(2)
+                                .frame(width: 6, height: 6)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(task.title)
+                                    .font(.system(size: 13, weight: .medium))
+                                    .lineLimit(2)
+                                Text(t("今天到期 · 尚未完成", "Due today · Not completed"))
+                                    .font(.system(size: 10.5, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                            }
                             Spacer()
                         }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 8)
-                        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 9)
+                        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                .strokeBorder(Color.primary.opacity(0.03), lineWidth: 1)
+                        }
                     }
                 }
             }
-            .frame(maxHeight: 205)
+            .frame(maxHeight: 214)
 
             HStack {
                 Button(t("30 分钟后再提醒", "Remind me in 30 min")) { onLater() }
-                    .buttonStyle(.bordered)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .buttonStyle(.plain)
                 Spacer()
                 Button(t("知道了", "Got it")) { onDismiss() }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.indigo)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 13)
+                    .padding(.vertical, 7)
+                    .background(Color.primary.opacity(0.09), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .buttonStyle(.plain)
                     .keyboardShortcut(.defaultAction)
             }
         }
-        .padding(22)
+        .padding(18)
         .frame(width: 410)
-        .background(.ultraThinMaterial)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(
+                    LinearGradient(
+                        colors: [Color.white.opacity(0.25), Color.white.opacity(0.06)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ),
+                    lineWidth: 1
+                )
+        }
     }
 
     private func t(_ chinese: String, _ english: String) -> String {
@@ -1659,10 +2144,45 @@ struct TodoItem: Identifiable, Codable, Equatable {
     }
 }
 
-enum PanelContent: Equatable {
-    case list
-    case composer
-    case editor(TodoItem)
+enum InlineTaskSchedule: Equatable {
+    case today
+    case tomorrow
+    case custom(Date)
+    case unscheduled
+
+    func dueDate(relativeTo now: Date = Date(), calendar: Calendar = .current) -> Date? {
+        switch self {
+        case .today:
+            return calendar.startOfDay(for: now)
+        case .tomorrow:
+            return calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now))
+        case .custom(let date):
+            return calendar.startOfDay(for: date)
+        case .unscheduled:
+            return nil
+        }
+    }
+}
+
+struct InlineTaskDraft: Equatable {
+    var title = ""
+    var priority: TaskPriority = .medium
+    var schedule: InlineTaskSchedule = .today
+
+    var trimmedTitle: String { title.trimmingCharacters(in: .whitespacesAndNewlines) }
+    var canSubmit: Bool { !trimmedTitle.isEmpty }
+
+    init(title: String = "", priority: TaskPriority = .medium, schedule: InlineTaskSchedule = .today) {
+        self.title = title
+        self.priority = priority
+        self.schedule = schedule
+    }
+
+    init(item: TodoItem) {
+        title = item.title
+        priority = item.priority
+        schedule = item.dueDate.map { .custom($0) } ?? .unscheduled
+    }
 }
 
 enum TaskPriority: String, CaseIterable, Codable, Identifiable {
@@ -1728,6 +2248,8 @@ enum TaskPriority: String, CaseIterable, Codable, Identifiable {
 @MainActor
 final class TaskStore: ObservableObject {
     @Published private(set) var tasks: [TodoItem] = []
+    // Share the unsent draft across panel rebuilds, collapse/expand, and editing.
+    @Published var inlineDraft = InlineTaskDraft()
     var onTasksChanged: (([TodoItem]) -> Void)?
 
     private let fileURL: URL
@@ -1806,6 +2328,23 @@ final class TaskStore: ObservableObject {
 
         tasks.append(TodoItem(title: trimmedTitle, priority: priority, dueDate: dueDate))
         save()
+    }
+
+    @discardableResult
+    func submitInlineDraft() -> Bool {
+        guard inlineDraft.canSubmit else { return false }
+        add(title: inlineDraft.trimmedTitle, priority: inlineDraft.priority, dueDate: inlineDraft.schedule.dueDate())
+        inlineDraft = InlineTaskDraft()
+        return true
+    }
+
+    @discardableResult
+    func saveInlineEdit(id: UUID, draft: InlineTaskDraft) -> Bool {
+        guard draft.canSubmit, let item = tasks.first(where: { $0.id == id }) else { return false }
+        let dueDate = draft.schedule.dueDate()
+        guard item.title != draft.trimmedTitle || item.priority != draft.priority || item.dueDate != dueDate else { return true }
+        update(item, title: draft.trimmedTitle, priority: draft.priority, dueDate: dueDate)
+        return true
     }
 
     func toggle(_ item: TodoItem) {
@@ -1897,7 +2436,7 @@ struct TodoPanelView: View {
     @ObservedObject var widget: DesktopWidgetController
     var panelID: UInt32? = nil
     var showsWidgetControls = false
-    @State private var panelContent: PanelContent = .list
+    @State private var editingItemID: UUID?
     @State private var completedExpanded = false
 
     private var today: Date { Calendar.current.startOfDay(for: Date()) }
@@ -1937,49 +2476,11 @@ struct TodoPanelView: View {
     }
 
     var body: some View {
-        panelContentView
+        taskListPanel
             .frame(width: 360, height: 460)
             .glassSurface(cornerRadius: 22)
             .environment(\.locale, languageSettings.language.locale)
             .preferredColorScheme(nil)
-            .onChange(of: panelContent) { newValue in
-                if showsWidgetControls, newValue != .list {
-                    if let panelID {
-                        widget.focusPanel(on: panelID)
-                    } else {
-                        widget.focusPanel()
-                    }
-                }
-            }
-    }
-
-    @ViewBuilder
-    private var panelContentView: some View {
-        switch panelContent {
-        case .list:
-            taskListPanel
-        case .composer:
-            TaskComposerSheet(
-                onCreate: { title, priority, dueDate in
-                    taskStore.add(title: title, priority: priority, dueDate: dueDate)
-                    panelContent = .list
-                },
-                onCancel: { panelContent = .list }
-            )
-        case .editor(let item):
-            TaskEditorSheet(
-                item: item,
-                onSave: { title, priority, dueDate in
-                    taskStore.update(item, title: title, priority: priority, dueDate: dueDate)
-                    panelContent = .list
-                },
-                onCancel: { panelContent = .list },
-                onDelete: {
-                    taskStore.delete(item)
-                    panelContent = .list
-                }
-            )
-        }
     }
 
     private var taskListPanel: some View {
@@ -1991,7 +2492,7 @@ struct TodoPanelView: View {
 
             Divider().opacity(0.35)
 
-            createTaskCard
+            InlineTaskComposer(onActivate: focusInlineComposer)
                 .padding(.horizontal, 13)
                 .padding(.top, 13)
                 .padding(.bottom, 10)
@@ -2031,23 +2532,6 @@ struct TodoPanelView: View {
 
     private var header: some View {
         HStack(alignment: .center, spacing: 14) {
-            ZStack {
-                Circle()
-                    .fill(
-                        LinearGradient(
-                            colors: [.cyan, .blue],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                    .frame(width: 36, height: 36)
-                    .shadow(color: .blue.opacity(0.16), radius: 4, y: 2)
-
-                Image(systemName: taskStore.remainingCount == 0 ? "checkmark" : "checklist")
-                    .font(.system(size: 15, weight: .bold))
-                    .foregroundStyle(.white)
-            }
-
             VStack(alignment: .leading, spacing: 3) {
                 Text(greeting)
                     .font(.system(size: 15, weight: .semibold, design: .rounded))
@@ -2073,8 +2557,8 @@ struct TodoPanelView: View {
                         .background(Color.primary.opacity(0.05), in: Circle())
                 }
                 .buttonStyle(.plain)
-                .help(t("收纳为小图标", "Collapse to icon"))
-                .accessibilityLabel(t("收纳为小图标", "Collapse to icon"))
+                .help(t("收纳为侧边标签", "Collapse to edge tab"))
+                .accessibilityLabel(t("收纳为侧边标签", "Collapse to edge tab"))
             }
 
             Button {
@@ -2095,34 +2579,13 @@ struct TodoPanelView: View {
         }
     }
 
-    private var createTaskCard: some View {
-        Button {
-            panelContent = .composer
-        } label: {
-            HStack(spacing: 10) {
-                Image(systemName: "plus.circle.fill")
-                    .font(.system(size: 17, weight: .semibold))
-
-                Text(t("新建待办", "New task"))
-                    .font(.system(size: 13, weight: .semibold))
-
-                Spacer()
-
-                Text(t("内容 · 优先级 · 日期", "Content · Priority · Date"))
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.white.opacity(0.78))
-            }
-            .foregroundStyle(.white)
-            .padding(.horizontal, 13)
-            .padding(.vertical, 11)
-            .background(
-                LinearGradient(colors: [.blue, .cyan], startPoint: .leading, endPoint: .trailing),
-                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-            )
-            .shadow(color: .blue.opacity(0.22), radius: 7, y: 3)
+    private func focusInlineComposer() {
+        guard showsWidgetControls else { return }
+        if let panelID {
+            widget.focusPanel(on: panelID)
+        } else {
+            widget.focusPanel()
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(t("新建待办", "New task"))
     }
 
     private func taskSection(title: String, subtitle: String, tasks: [TodoItem]) -> some View {
@@ -2144,9 +2607,20 @@ struct TodoPanelView: View {
 
             VStack(spacing: 7) {
                 ForEach(tasks) { item in
-                    TaskRow(item: item, onEdit: { panelContent = .editor(item) })
+                    editableTaskRow(item)
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func editableTaskRow(_ item: TodoItem, compactCompletedStyle: Bool = false) -> some View {
+        if editingItemID == item.id {
+            InlineTaskEditor(item: item, onActivate: focusInlineComposer, onFinish: {
+                if editingItemID == item.id { editingItemID = nil }
+            })
+        } else {
+            TaskRow(item: item, onEdit: { editingItemID = item.id }, compactCompletedStyle: compactCompletedStyle)
         }
     }
 
@@ -2154,7 +2628,7 @@ struct TodoPanelView: View {
         DisclosureGroup(isExpanded: $completedExpanded) {
             VStack(spacing: 7) {
                 ForEach(taskStore.completedTasks) { item in
-                    TaskRow(item: item, onEdit: { panelContent = .editor(item) }, compactCompletedStyle: true)
+                    editableTaskRow(item, compactCompletedStyle: true)
                 }
 
                 Button {
@@ -2211,346 +2685,172 @@ struct TodoPanelView: View {
 
 }
 
-struct TaskComposerSheet: View {
-    let onCreate: (String, TaskPriority, Date) -> Void
-    let onCancel: () -> Void
+@MainActor
+final class InlineInteractionSession: ObservableObject {
+    private static let activeSessions = NSHashTable<InlineInteractionSession>.weakObjects()
+    private let regions = NSHashTable<NSView>.weakObjects()
+    private var localMonitor: Any?
+    private var globalMonitor: Any?
+    private var resignObserver: NSObjectProtocol?
+    private var onOutside: (() -> Void)?
+    private var generation = 0
+    private(set) var isActive = false
 
+    func register(_ view: NSView) { regions.add(view) }
+    func unregister(_ view: NSView) { regions.remove(view) }
+
+    static func containsPopupClick(for panel: NSWindow, at point: NSPoint) -> Bool {
+        activeSessions.allObjects.contains { session in
+            let views = session.regions.allObjects
+            guard views.contains(where: { $0.window === panel }) else { return false }
+            return views.contains { view in
+                guard let window = view.window, window !== panel, window.isVisible else { return false }
+                return window.frame.contains(point)
+            }
+        }
+    }
+
+    func start(onOutside: @escaping () -> Void) {
+        stop()
+        self.onOutside = onOutside
+        isActive = true
+        Self.activeSessions.add(self)
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            self?.handlePointerDown(event)
+            return event
+        }
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            DispatchQueue.main.async { self?.dismiss() }
+        }
+        resignObserver = NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: nil, queue: .main) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self, self.isActive else { return }
+                if !self.regions.allObjects.contains(where: { $0.window?.isKeyWindow == true }) {
+                    self.dismiss()
+                }
+            }
+        }
+    }
+
+    func stop() {
+        generation += 1
+        isActive = false
+        Self.activeSessions.remove(self)
+        onOutside = nil
+        if let localMonitor { NSEvent.removeMonitor(localMonitor) }
+        if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
+        if let resignObserver { NotificationCenter.default.removeObserver(resignObserver) }
+        localMonitor = nil
+        globalMonitor = nil
+        resignObserver = nil
+    }
+
+    func contains(_ event: NSEvent) -> Bool {
+        guard let window = event.window else { return false }
+        return regions.allObjects.contains { view in
+            guard view.window === window, !view.isHiddenOrHasHiddenAncestor else { return false }
+            return view.bounds.contains(view.convert(event.locationInWindow, from: nil))
+        }
+    }
+
+    func handlePointerDown(_ event: NSEvent) {
+        if isActive && !contains(event) { dismiss() }
+    }
+
+    func requestFocus(_ action: @escaping () -> Void) {
+        let expectedGeneration = generation
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isActive, self.generation == expectedGeneration else { return }
+            guard self.regions.allObjects.contains(where: { $0.window?.isKeyWindow == true }) else { return }
+            action()
+        }
+    }
+
+    func dismiss() {
+        guard isActive else { return }
+        let callback = onOutside
+        stop()
+        let expectedGeneration = generation
+        // Do not consume the click or reflow the list before its target handles it.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.generation == expectedGeneration else { return }
+            callback?()
+        }
+    }
+
+    deinit {
+        if let localMonitor { NSEvent.removeMonitor(localMonitor) }
+        if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
+        if let resignObserver { NotificationCenter.default.removeObserver(resignObserver) }
+    }
+}
+
+private struct InlineInteractionRegion: NSViewRepresentable {
+    let session: InlineInteractionSession
+
+    func makeNSView(context: Context) -> InlineInteractionRegionView {
+        let view = InlineInteractionRegionView()
+        session.register(view)
+        view.session = session
+        return view
+    }
+
+    func updateNSView(_ view: InlineInteractionRegionView, context: Context) {}
+
+    static func dismantleNSView(_ view: InlineInteractionRegionView, coordinator: ()) {
+        view.session?.unregister(view)
+    }
+}
+
+private final class InlineInteractionRegionView: NSView {
+    weak var session: InlineInteractionSession?
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+struct InlineTaskComposer: View {
+    @EnvironmentObject private var taskStore: TaskStore
     @ObservedObject private var languageSettings = LanguageSettings.shared
-    @State private var step = 1
-    @State private var title = ""
-    @State private var priority: TaskPriority = .medium
-    @State private var selectedMonth = Calendar.current.component(.month, from: Date())
-    @State private var selectedDay = Calendar.current.component(.day, from: Date())
-    @FocusState private var titleIsFocused: Bool
-
-    private var isTitleValid: Bool {
-        !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    private var daysInSelectedMonth: Int {
-        var components = DateComponents()
-        components.year = Calendar.current.component(.year, from: Date())
-        components.month = selectedMonth
-        components.day = 1
-        guard let firstDay = Calendar.current.date(from: components) else { return 31 }
-        return Calendar.current.range(of: .day, in: .month, for: firstDay)?.count ?? 31
-    }
-
-    private var selectedDueDate: Date {
-        var components = DateComponents()
-        components.year = Calendar.current.component(.year, from: Date())
-        components.month = selectedMonth
-        components.day = min(selectedDay, daysInSelectedMonth)
-        return Calendar.current.date(from: components) ?? Calendar.current.startOfDay(for: Date())
-    }
+    let onActivate: () -> Void
+    @State private var isExpanded = false
+    @State private var isHovering = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack(alignment: .top, spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(t("新建待办", "New task"))
-                        .font(.system(size: 18, weight: .bold, design: .rounded))
-                    Text(t("三步安排好一件要做的事", "Shape one task in three quick steps"))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                Button {
-                    onCancel()
-                } label: {
-                    Label(t("取消", "Cancel"), systemImage: "xmark")
-                        .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 6)
-                }
-                .buttonStyle(.bordered)
-                .tint(.secondary)
-                .help(t("放弃新建", "Discard new task"))
-            }
-
-            stepIndicator
-
-            stepContent
-                .frame(maxHeight: .infinity, alignment: .top)
-
-            HStack(spacing: 10) {
-                if step > 1 {
-                    Button {
-                        withAnimation(.snappy(duration: 0.2)) { step -= 1 }
-                    } label: {
-                        Label(t("上一步", "Back"), systemImage: "chevron.left")
+        Group {
+            if isExpanded {
+                InlineTaskInput(
+                    draft: $taskStore.inlineDraft,
+                    showsPlus: true,
+                    submitTitle: t("添加", "Add"),
+                    onActivate: onActivate,
+                    onSubmit: { taskStore.submitInlineDraft() },
+                    onEnd: { isExpanded = false }
+                )
+            } else {
+                Button { isExpanded = true } label: {
+                    HStack(spacing: 9) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        Text(taskStore.inlineDraft.title.isEmpty ? t("添加待办…", "Add a task…") : taskStore.inlineDraft.title)
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(taskStore.inlineDraft.title.isEmpty ? .secondary : .primary)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
                     }
-                    .buttonStyle(.bordered)
-                    .tint(.secondary)
-                }
-
-                Spacer()
-
-                Button {
-                    if step == 3 {
-                        onCreate(title.trimmingCharacters(in: .whitespacesAndNewlines), priority, selectedDueDate)
-                    } else {
-                        withAnimation(.snappy(duration: 0.2)) { step += 1 }
+                    .padding(12)
+                    .contentShape(Rectangle())
+                    .background(Color.primary.opacity(isHovering ? 0.06 : 0.04), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.03), lineWidth: 1)
+                            .allowsHitTesting(false)
                     }
-                } label: {
-                    Label(
-                        step == 3 ? t("创建待办", "Create task") : t("下一步", "Next"),
-                        systemImage: step == 3 ? "checkmark" : "chevron.right"
-                    )
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.blue)
-                .disabled(step == 1 && !isTitleValid)
-                .keyboardShortcut(.defaultAction)
-            }
-            .padding(.top, 2)
-        }
-        .padding(20)
-        .frame(width: 350)
-        .frame(minHeight: 420, alignment: .top)
-        .onAppear { titleIsFocused = true }
-        .onChange(of: selectedMonth) { _ in
-            selectedDay = min(selectedDay, daysInSelectedMonth)
-        }
-    }
-
-    private var stepIndicator: some View {
-        HStack(spacing: 0) {
-            ForEach(1...3, id: \.self) { number in
-                HStack(spacing: 6) {
-                    ZStack {
-                        Circle()
-                            .fill(number <= step ? Color.blue : Color.primary.opacity(0.08))
-                            .frame(width: 20, height: 20)
-                        if number < step {
-                            Image(systemName: "checkmark")
-                                .font(.system(size: 9, weight: .black))
-                                .foregroundStyle(.white)
-                        } else {
-                            Text("\(number)")
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(number == step ? .white : .secondary)
-                        }
-                    }
-                    Text(stepName(number))
-                        .font(.caption.weight(number == step ? .semibold : .regular))
-                        .foregroundStyle(number == step ? .primary : .secondary)
-                }
-
-                if number < 3 {
-                    Rectangle()
-                        .fill(number < step ? Color.blue.opacity(0.5) : Color.primary.opacity(0.1))
-                        .frame(height: 1.5)
-                        .padding(.horizontal, 8)
-                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(taskStore.inlineDraft.title.isEmpty ? t("新建待办", "New task") : t("继续编辑待办草稿", "Continue task draft"))
             }
         }
-    }
-
-    @ViewBuilder
-    private var stepContent: some View {
-        switch step {
-        case 1: titleStep
-        case 2: priorityStep
-        default: dateStep
-        }
-    }
-
-    private func stepHeader(_ icon: String, _ title: String, _ subtitle: String) -> some View {
-        HStack(spacing: 11) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(LinearGradient(colors: [.blue, .cyan], startPoint: .topLeading, endPoint: .bottomTrailing))
-                    .frame(width: 34, height: 34)
-                    .shadow(color: .blue.opacity(0.25), radius: 5, y: 2)
-                Image(systemName: icon)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.white)
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.system(size: 16, weight: .bold, design: .rounded))
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private var titleStep: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            stepHeader(
-                "pencil.line",
-                t("写下要做的事", "Write down the task"),
-                t("保持简短、具体，下一步再安排细节。", "Keep it short and specific; arrange details next.")
-            )
-            TextField(t("例如：整理项目周报", "e.g. Prepare the project update"), text: $title)
-                .textFieldStyle(.plain)
-                .font(.system(size: 15, weight: .medium))
-                .focused($titleIsFocused)
-                .onSubmit {
-                    if isTitleValid { step = 2 }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 11)
-                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        .strokeBorder(titleIsFocused ? Color.blue.opacity(0.55) : Color.primary.opacity(0.05), lineWidth: 1.5)
-                }
-            HStack(spacing: 5) {
-                Image(systemName: "return")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(.secondary)
-                Text(t("按回车进入下一步", "Press return to continue"))
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-        }
-        .padding(14)
-        .frame(minHeight: 156, alignment: .top)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.04), lineWidth: 1)
-        }
-    }
-
-    private var priorityStep: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            stepHeader(
-                "flag.fill",
-                t("选择优先级", "Choose priority"),
-                t("优先级帮你安排处理顺序。", "Priority arranges the order you handle things.")
-            )
-            VStack(spacing: 8) {
-                ForEach(TaskPriority.allCases) { option in
-                    Button {
-                        withAnimation(.snappy(duration: 0.18)) { priority = option }
-                    } label: {
-                        HStack(spacing: 10) {
-                            ZStack {
-                                Circle()
-                                    .fill(priority == option ? option.color : option.color.opacity(0.15))
-                                    .frame(width: 26, height: 26)
-                                Image(systemName: option.symbol)
-                                    .font(.system(size: 11, weight: .bold))
-                                    .foregroundStyle(priority == option ? .white : option.color)
-                            }
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(option.priorityLabel(in: languageSettings.language))
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(.primary)
-                                Text(option.subtitle(in: languageSettings.language))
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            if priority == option {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .font(.system(size: 14))
-                                    .foregroundStyle(option.color)
-                            }
-                        }
-                        .padding(.horizontal, 11)
-                        .padding(.vertical, 8)
-                        .background(
-                            priority == option ? option.color.opacity(0.12) : Color.primary.opacity(0.04),
-                            in: RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        )
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                .strokeBorder(priority == option ? option.color.opacity(0.5) : Color.primary.opacity(0.04), lineWidth: 1)
-                        }
-                        .contentShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-        .padding(14)
-        .frame(minHeight: 210, alignment: .top)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.04), lineWidth: 1)
-        }
-    }
-
-    private var dateStep: some View {
-        VStack(alignment: .leading, spacing: 11) {
-            stepHeader(
-                "calendar",
-                t("选择日期", "Choose date"),
-                t("默认安排在今天，需要时再调整。", "Defaults to today; adjust only when needed.")
-            )
-            HStack(spacing: 8) {
-                quickDateChip(days: 0, label: t("今天", "Today"))
-                quickDateChip(days: 1, label: t("明天", "Tomorrow"))
-                quickDateChip(days: 2, label: t("后天", "In 2 days"))
-                Spacer()
-            }
-            HStack(spacing: 10) {
-                dateWheelPicker(title: t("月", "Month"), selection: $selectedMonth, values: Array(1...12), suffix: languageSettings.language == .english ? "" : "月")
-                dateWheelPicker(title: t("日", "Day"), selection: $selectedDay, values: Array(1...daysInSelectedMonth), suffix: languageSettings.language == .english ? "" : "日")
-            }
-            .frame(height: 112)
-
-            Label(t("已选择 \(selectedMonth) 月 \(selectedDay) 日", "Selected: \(selectedMonth)/\(selectedDay)"), systemImage: "calendar.badge.checkmark")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.blue)
-        }
-        .padding(14)
-        .frame(minHeight: 252, alignment: .top)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.04), lineWidth: 1)
-        }
-    }
-
-    private func quickDateChip(days: Int, label: String) -> some View {
-        let calendar = Calendar.current
-        let target = calendar.startOfDay(for: calendar.date(byAdding: .day, value: days, to: Date()) ?? Date())
-        let isSelected = calendar.isDate(selectedDueDate, inSameDayAs: target)
-        return Button {
-            selectedMonth = calendar.component(.month, from: target)
-            selectedDay = calendar.component(.day, from: target)
-        } label: {
-            Text(label)
-                .font(.caption.weight(.semibold))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .foregroundStyle(isSelected ? Color.blue : Color.secondary)
-                .background(isSelected ? Color.blue.opacity(0.14) : Color.primary.opacity(0.05), in: Capsule())
-                .overlay {
-                    Capsule().strokeBorder(isSelected ? Color.blue.opacity(0.45) : Color.clear, lineWidth: 1)
-                }
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func dateWheelPicker(title: String, selection: Binding<Int>, values: [Int], suffix: String) -> some View {
-        MouseWheelValuePicker(title: title, selection: selection, values: values, suffix: suffix, hint: t("滚动缓慢切换", "Scroll to adjust"))
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.03), lineWidth: 1)
-            }
-    }
-
-    private func stepName(_ number: Int) -> String {
-        switch number {
-        case 1: return t("待办", "Task")
-        case 2: return t("优先级", "Priority")
-        default: return t("日期", "Date")
-        }
+        .onHover { isHovering = $0 }
     }
 
     private func t(_ chinese: String, _ english: String) -> String {
@@ -2558,242 +2858,250 @@ struct TaskComposerSheet: View {
     }
 }
 
-struct MouseWheelValuePicker: NSViewRepresentable {
-    let title: String
-    @Binding var selection: Int
-    let values: [Int]
-    let suffix: String
-    let hint: String
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(parent: self)
-    }
-
-    func makeNSView(context: Context) -> WheelPickerNSView {
-        let view = WheelPickerNSView()
-        view.onStep = { step in
-            context.coordinator.move(by: step)
-        }
-        view.configure(title: title, value: selection, values: values, suffix: suffix, hint: hint)
-        return view
-    }
-
-    func updateNSView(_ nsView: WheelPickerNSView, context: Context) {
-        context.coordinator.parent = self
-        nsView.configure(title: title, value: selection, values: values, suffix: suffix, hint: hint)
-    }
-
-    final class Coordinator: NSObject {
-        var parent: MouseWheelValuePicker
-
-        init(parent: MouseWheelValuePicker) {
-            self.parent = parent
-        }
-
-        func move(by step: Int) {
-            guard let currentIndex = parent.values.firstIndex(of: parent.selection), !parent.values.isEmpty else { return }
-            let nextIndex = (currentIndex + step % parent.values.count + parent.values.count) % parent.values.count
-            parent.selection = parent.values[nextIndex]
-        }
-    }
-}
-
-final class WheelPickerNSView: NSView {
-    var onStep: (Int) -> Void = { _ in }
-
-    private let titleLabel = NSTextField(labelWithString: "")
-    private let previousLabel = NSTextField(labelWithString: "")
-    private let valueLabel = NSTextField(labelWithString: "")
-    private let nextLabel = NSTextField(labelWithString: "")
-    private let hintLabel = NSTextField(labelWithString: "")
-    private var accumulatedDelta: CGFloat = 0
-    private var lastStepTimestamp: TimeInterval = 0
-    private let minimumStepInterval: TimeInterval = 0.32
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        setupViews()
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        setupViews()
-    }
-
-    private func setupViews() {
-        wantsLayer = true
-        [titleLabel, previousLabel, valueLabel, nextLabel, hintLabel].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
-            $0.alignment = .center
-            addSubview($0)
-        }
-
-        titleLabel.font = .systemFont(ofSize: 11, weight: .semibold)
-        titleLabel.textColor = .secondaryLabelColor
-        previousLabel.font = .systemFont(ofSize: 12, weight: .regular)
-        previousLabel.textColor = .tertiaryLabelColor
-        valueLabel.font = .monospacedDigitSystemFont(ofSize: 21, weight: .semibold)
-        valueLabel.textColor = .labelColor
-        nextLabel.font = .systemFont(ofSize: 12, weight: .regular)
-        nextLabel.textColor = .tertiaryLabelColor
-        hintLabel.font = .systemFont(ofSize: 9, weight: .regular)
-        hintLabel.textColor = .tertiaryLabelColor
-
-        NSLayoutConstraint.activate([
-            titleLabel.topAnchor.constraint(equalTo: topAnchor, constant: 7),
-            titleLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
-            previousLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 1),
-            previousLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
-            valueLabel.topAnchor.constraint(equalTo: previousLabel.bottomAnchor, constant: -1),
-            valueLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
-            nextLabel.topAnchor.constraint(equalTo: valueLabel.bottomAnchor, constant: -1),
-            nextLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
-            hintLabel.topAnchor.constraint(equalTo: nextLabel.bottomAnchor, constant: 1),
-            hintLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
-            hintLabel.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -5)
-        ])
-    }
-
-    func configure(title: String, value: Int, values: [Int], suffix: String, hint: String) {
-        titleLabel.stringValue = title
-        valueLabel.stringValue = "\(value)\(suffix)"
-        hintLabel.stringValue = hint
-
-        guard let index = values.firstIndex(of: value), !values.isEmpty else {
-            previousLabel.stringValue = ""
-            nextLabel.stringValue = ""
-            return
-        }
-
-        let previousIndex = (index - 1 + values.count) % values.count
-        let nextIndex = (index + 1) % values.count
-        previousLabel.stringValue = "\(values[previousIndex])\(suffix)"
-        nextLabel.stringValue = "\(values[nextIndex])\(suffix)"
-    }
-
-    override func scrollWheel(with event: NSEvent) {
-        let threshold: CGFloat = event.hasPreciseScrollingDeltas ? 18 : 1
-        accumulatedDelta += event.scrollingDeltaY
-
-        guard abs(accumulatedDelta) >= threshold else { return }
-
-        let now = ProcessInfo.processInfo.systemUptime
-        guard now - lastStepTimestamp >= minimumStepInterval else { return }
-
-        onStep(accumulatedDelta > 0 ? -1 : 1)
-        accumulatedDelta = 0
-        lastStepTimestamp = now
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        super.mouseDown(with: event)
-    }
-}
-
-struct TaskEditorSheet: View {
-    let item: TodoItem
-    let onSave: (String, TaskPriority, Date?) -> Void
-    let onCancel: () -> Void
-    let onDelete: () -> Void
-
+struct InlineTaskEditor: View {
+    @EnvironmentObject private var taskStore: TaskStore
     @ObservedObject private var languageSettings = LanguageSettings.shared
-    @State private var title: String
-    @State private var priority: TaskPriority
-    @State private var hasDueDate: Bool
-    @State private var dueDate: Date
-    @FocusState private var titleIsFocused: Bool
+    let item: TodoItem
+    let onActivate: () -> Void
+    let onFinish: () -> Void
+    @State private var draft: InlineTaskDraft
+    @State private var didFinish = false
 
-    init(
-        item: TodoItem,
-        onSave: @escaping (String, TaskPriority, Date?) -> Void,
-        onCancel: @escaping () -> Void,
-        onDelete: @escaping () -> Void
-    ) {
+    init(item: TodoItem, onActivate: @escaping () -> Void, onFinish: @escaping () -> Void) {
         self.item = item
-        self.onSave = onSave
-        self.onCancel = onCancel
-        self.onDelete = onDelete
-        _title = State(initialValue: item.title)
-        _priority = State(initialValue: item.priority)
-        _hasDueDate = State(initialValue: item.dueDate != nil)
-        _dueDate = State(initialValue: Calendar.current.startOfDay(for: item.dueDate ?? Date()))
-    }
-
-    private var canSave: Bool {
-        !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        self.onActivate = onActivate
+        self.onFinish = onFinish
+        _draft = State(initialValue: InlineTaskDraft(item: item))
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 17) {
-            HStack {
-                Text(t("编辑待办", "Edit task"))
-                    .font(.system(size: 17, weight: .bold, design: .rounded))
-                Spacer()
-                Button(role: .destructive) { onDelete() } label: {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.red)
-                .help(t("删除任务", "Delete task"))
-                Button(t("取消", "Cancel")) { onCancel() }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
+        InlineTaskInput(
+            draft: $draft,
+            showsPlus: false,
+            submitTitle: languageSettings.text("保存", "Save"),
+            onActivate: onActivate,
+            onSubmit: { finish(); return false },
+            onEnd: finish,
+            onDelete: {
+                didFinish = true
+                taskStore.delete(item)
+                onFinish()
             }
+        )
+        .onDisappear {
+            // Switching rows or collapsing a window must not discard valid edits.
+            if !didFinish { taskStore.saveInlineEdit(id: item.id, draft: draft) }
+        }
+    }
 
-            VStack(alignment: .leading, spacing: 7) {
-                Text(t("待办内容", "Task"))
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                TextField(t("待办内容", "Task"), text: $title)
-                    .textFieldStyle(.roundedBorder)
-                    .focused($titleIsFocused)
-            }
+    private func finish() {
+        guard !didFinish else { return }
+        didFinish = true
+        taskStore.saveInlineEdit(id: item.id, draft: draft)
+        onFinish()
+    }
+}
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text(t("优先级", "Priority"))
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Picker(t("优先级", "Priority"), selection: $priority) {
-                    ForEach(TaskPriority.allCases) { option in
-                        Text(option.priorityLabel(in: languageSettings.language)).tag(option)
-                    }
-                }
-                .pickerStyle(.segmented)
-            }
+struct InlineTaskInput: View {
+    @Binding var draft: InlineTaskDraft
+    let showsPlus: Bool
+    let submitTitle: String
+    let onActivate: () -> Void
+    let onSubmit: () -> Bool
+    let onEnd: () -> Void
+    var onDelete: (() -> Void)? = nil
+    @ObservedObject private var languageSettings = LanguageSettings.shared
+    @StateObject private var interaction = InlineInteractionSession()
+    @State private var showsPriorityPicker = false
+    @State private var showsDatePicker = false
+    @State private var customDate = Date()
+    @FocusState private var titleIsFocused: Bool
 
-            VStack(alignment: .leading, spacing: 7) {
-                Toggle(t("设置截止日期", "Set due date"), isOn: $hasDueDate)
-                    .toggleStyle(.switch)
+    private var scheduleLabel: String {
+        switch draft.schedule {
+        case .today: return t("今天", "Today")
+        case .tomorrow: return t("明天", "Tomorrow")
+        case .unscheduled: return t("不设日期", "No date")
+        case .custom(let date):
+            let format = Date.FormatStyle.dateTime.locale(languageSettings.language.locale)
+            return Calendar.current.isDate(date, equalTo: Date(), toGranularity: .year)
+                ? date.formatted(format.month(.abbreviated).day())
+                : date.formatted(format.year().month(.abbreviated).day())
+        }
+    }
 
-                if hasDueDate {
-                    DatePicker(t("截止日期", "Due date"), selection: $dueDate, displayedComponents: .date)
-                        .datePickerStyle(.compact)
-                } else {
-                    Text(t("此任务暂不安排日期。", "This task has no scheduled date."))
-                        .font(.caption)
+    var body: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack(spacing: 9) {
+                if showsPlus {
+                    Image(systemName: "plus")
+                        .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
+                TextField(showsPlus ? t("添加待办…", "Add a task…") : t("待办内容", "Task title"), text: $draft.title)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13, weight: .medium))
+                    .focused($titleIsFocused)
+                    .onSubmit { submit() }
+                    .onExitCommand { end() }
+                    .accessibilityLabel(t("待办内容", "Task title"))
             }
-
-            HStack {
-                Spacer()
-                Button(t("保存修改", "Save changes")) {
-                    onSave(
-                        title.trimmingCharacters(in: .whitespacesAndNewlines),
-                        priority,
-                        hasDueDate ? Calendar.current.startOfDay(for: dueDate) : nil
-                    )
-                    onCancel()
+            HStack(spacing: 8) {
+                priorityButton
+                dateButton
+                Spacer(minLength: 0)
+                if let onDelete {
+                    Button(action: {
+                        interaction.stop()
+                        titleIsFocused = false
+                        onDelete()
+                    }) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 6)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(t("删除事项", "Delete task"))
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.blue)
-                .disabled(!canSave)
-                .keyboardShortcut(.defaultAction)
+                Button(submitTitle) { submit() }
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(draft.canSubmit ? .primary : .tertiary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .buttonStyle(.plain)
+                    .disabled(!draft.canSubmit)
             }
         }
-        .padding(22)
-        .frame(width: 350)
-        .onAppear { titleIsFocused = true }
+        .padding(12)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
+                .allowsHitTesting(false)
+        }
+        .background(InlineInteractionRegion(session: interaction))
+        .onAppear {
+            interaction.start(onOutside: end)
+            onActivate()
+            focusTitle()
+        }
+        .onDisappear {
+            interaction.stop()
+            titleIsFocused = false
+        }
+    }
+
+    private var priorityButton: some View {
+        Button { showsPriorityPicker = true } label: {
+            optionLabel(draft.priority.priorityLabel(in: languageSettings.language))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(t("选择优先级", "Choose priority"))
+        .popover(isPresented: $showsPriorityPicker) {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(TaskPriority.allCases) { option in
+                    Button {
+                        draft.priority = option
+                        showsPriorityPicker = false
+                        focusTitle()
+                    } label: {
+                        Text(option.priorityLabel(in: languageSettings.language))
+                            .font(.system(size: 12, weight: .medium))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                            .background(Color.primary.opacity(draft.priority == option ? 0.08 : 0), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(7)
+            .frame(width: 150)
+            .background(InlineInteractionRegion(session: interaction))
+        }
+    }
+
+    private var dateButton: some View {
+        Button {
+            customDate = draft.schedule.dueDate() ?? Date()
+            showsDatePicker = true
+        } label: {
+            optionLabel(scheduleLabel)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(t("选择日期", "Choose date"))
+        .popover(isPresented: $showsDatePicker) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 7) {
+                    quickDateButton(t("今天", "Today"), schedule: .today)
+                    quickDateButton(t("明天", "Tomorrow"), schedule: .tomorrow)
+                    quickDateButton(t("不设日期", "No date"), schedule: .unscheduled)
+                }
+                Divider()
+                DatePicker(t("截止日期", "Due date"), selection: $customDate, displayedComponents: .date)
+                    .datePickerStyle(.graphical)
+                    .labelsHidden()
+                HStack {
+                    Spacer()
+                    Button(t("确定", "Done")) { selectSchedule(.custom(customDate)) }
+                        .buttonStyle(.bordered)
+                        .tint(.secondary)
+                }
+            }
+            .padding(14)
+            .frame(width: 280)
+            .environment(\.locale, languageSettings.language.locale)
+            .background(InlineInteractionRegion(session: interaction))
+        }
+    }
+
+    private func optionLabel(_ title: String) -> some View {
+        HStack(spacing: 4) {
+            Text(title).lineLimit(1)
+            Image(systemName: "chevron.down").font(.system(size: 7, weight: .semibold))
+        }
+        .font(.system(size: 10.5, weight: .medium))
+        .foregroundStyle(.secondary)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+    }
+
+    private func quickDateButton(_ label: String, schedule: InlineTaskSchedule) -> some View {
+        Button(label) { selectSchedule(schedule) }
+            .font(.system(size: 11, weight: .medium))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .buttonStyle(.plain)
+    }
+
+    private func selectSchedule(_ schedule: InlineTaskSchedule) {
+        draft.schedule = schedule
+        showsDatePicker = false
+        focusTitle()
+    }
+
+    private func focusTitle() {
+        interaction.requestFocus { titleIsFocused = true }
+    }
+
+    private func end() {
+        interaction.stop()
+        titleIsFocused = false
+        onEnd()
+    }
+
+    private func submit() {
+        guard draft.canSubmit else { return }
+        if onSubmit() {
+            focusTitle()
+        } else {
+            interaction.stop()
+            titleIsFocused = false
+        }
     }
 
     private func t(_ chinese: String, _ english: String) -> String {
@@ -2808,6 +3116,13 @@ struct TaskRow: View {
     let onEdit: () -> Void
     var compactCompletedStyle = false
     @State private var isHovering = false
+    @FocusState private var statusActionFocused: Bool
+
+    private var statusActionVisible: Bool { isHovering || statusActionFocused }
+
+    private var statusActionLabel: String {
+        item.isCompleted ? t("恢复", "Restore") : t("完成", "Complete")
+    }
 
     private var dueDescription: (text: String, color: Color)? {
         guard let dueDate = item.dueDate else { return nil }
@@ -2830,30 +3145,6 @@ struct TaskRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Button {
-                taskStore.toggle(item)
-            } label: {
-                ZStack {
-                    Circle()
-                        .fill(item.isCompleted ? Color.blue : Color.clear)
-                        .overlay {
-                            Circle()
-                                .strokeBorder(item.isCompleted ? Color.blue : Color.primary.opacity(0.32), lineWidth: 1.5)
-                        }
-
-                    if item.isCompleted {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 10, weight: .black))
-                            .foregroundStyle(.white)
-                    }
-                }
-                .frame(width: 28, height: 28)
-                .contentShape(Circle())
-            }
-            .buttonStyle(.borderless)
-            .help(item.isCompleted ? t("恢复未完成", "Mark as incomplete") : t("标记为完成", "Mark as complete"))
-            .accessibilityLabel(item.isCompleted ? t("恢复：\(item.title)", "Restore: \(item.title)") : t("完成：\(item.title)", "Complete: \(item.title)"))
-
             Button(action: onEdit) {
                 VStack(alignment: .leading, spacing: 5) {
                     Text(item.title)
@@ -2862,8 +3153,8 @@ struct TaskRow: View {
                         .strikethrough(item.isCompleted, color: .secondary.opacity(0.7))
                         .lineLimit(2)
 
-                    HStack(spacing: 7) {
-                        if !item.isCompleted {
+                    if !item.isCompleted {
+                        HStack(spacing: 7) {
                             HStack(spacing: 4) {
                                 Circle()
                                     .fill(item.priority.color)
@@ -2871,14 +3162,14 @@ struct TaskRow: View {
                                 Text(item.priority.priorityLabel(in: languageSettings.language))
                             }
                             .foregroundStyle(.secondary)
-                        }
 
-                        if !item.isCompleted, let dueDescription {
-                            Label(dueDescription.text, systemImage: "calendar")
-                                .foregroundStyle(dueDescription.color)
+                            if let dueDescription {
+                                Label(dueDescription.text, systemImage: "calendar")
+                                    .foregroundStyle(dueDescription.color)
+                            }
                         }
+                        .font(.system(size: 10.5, weight: .medium))
                     }
-                    .font(.system(size: 10.5, weight: .medium))
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
@@ -2886,6 +3177,26 @@ struct TaskRow: View {
             .buttonStyle(.plain)
             .help(t("点击编辑待办", "Click to edit task"))
             .accessibilityLabel(t("编辑：\(item.title)", "Edit: \(item.title)"))
+            .accessibilityAction(named: Text(statusActionLabel)) { taskStore.toggle(item) }
+
+            Button {
+                taskStore.toggle(item)
+            } label: {
+                Text(statusActionLabel)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .frame(minHeight: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .fixedSize(horizontal: true, vertical: false)
+            .focused($statusActionFocused)
+            // Reserve the action's width so revealing it never shifts the title.
+            .opacity(statusActionVisible ? 1 : 0)
+            .allowsHitTesting(statusActionVisible)
+            .help(item.isCompleted ? t("恢复未完成", "Mark as incomplete") : t("标记为完成", "Mark as complete"))
+            .accessibilityLabel(item.isCompleted ? t("恢复：\(item.title)", "Restore: \(item.title)") : t("完成：\(item.title)", "Complete: \(item.title)"))
         }
         .padding(.horizontal, 10)
         .padding(.vertical, compactCompletedStyle ? 7 : 8)
@@ -2896,6 +3207,7 @@ struct TaskRow: View {
             in: RoundedRectangle(cornerRadius: 11, style: .continuous)
         )
         .animation(.easeInOut(duration: 0.15), value: isHovering)
+        .animation(.easeInOut(duration: 0.15), value: statusActionFocused)
         .onHover { isHovering = $0 }
         .overlay {
             RoundedRectangle(cornerRadius: 11, style: .continuous)
