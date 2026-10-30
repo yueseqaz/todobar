@@ -6,6 +6,7 @@ struct WidgetEdgeTabTests {
         try! InlineTaskEditingTests.run()
         try! ReminderSettingsTests.run()
         ReminderTimeInputTests.run()
+        try! QuickCaptureTests.run()
         let screen = NSRect(x: -1440, y: -200, width: 1440, height: 1000)
         let visible = NSRect(x: -1380, y: -150, width: 1380, height: 920)
         let left = DesktopWidgetController.collapsedFrame(side: .left, y: 100, screenFrame: screen, visibleFrame: visible)

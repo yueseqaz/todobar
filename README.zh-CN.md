@@ -2,7 +2,7 @@
 
 一个轻量、原生的 macOS 菜单栏待办应用。原地记录和编辑事项，将清单收纳到桌面侧边，按自己的节奏设置提醒。使用 SwiftUI 构建，采用克制的毛玻璃界面，任务保存在本机。
 
-[English](README.md) · [v1.1.0 正式版](https://github.com/yueseqaz/todobar/releases/tag/v1.1.0) · [下载 Apple Silicon 安装包](https://github.com/yueseqaz/todobar/releases/download/v1.1.0/TodoBar-macos-arm64.zip) · [更新说明](RELEASE_NOTES.md)
+[English](README.md) · [v1.1.1 正式版](https://github.com/yueseqaz/todobar/releases/tag/v1.1.1) · [下载 Apple Silicon 安装包](https://github.com/yueseqaz/todobar/releases/download/v1.1.1/TodoBar-macos-arm64.zip) · [更新说明](RELEASE_NOTES.md)
 
 ## 界面预览
 
@@ -21,9 +21,9 @@
 
 ## 下载与安装
 
-**当前正式版：v1.1.0。适用于 macOS 13 及以上的 Apple Silicon（M 系列）Mac，发布包不支持 Intel Mac。**
+**当前正式版：v1.1.1。适用于 macOS 13 及以上的 Apple Silicon（M 系列）Mac，发布包不支持 Intel Mac。**
 
-1. 从[官方 Release](https://github.com/yueseqaz/todobar/releases/tag/v1.1.0) 下载 `TodoBar-macos-arm64.zip` 和 `SHA256SUMS.txt`。
+1. 从[官方 Release](https://github.com/yueseqaz/todobar/releases/tag/v1.1.1) 下载 `TodoBar-macos-arm64.zip` 和 `SHA256SUMS.txt`。
 2. 将两个文件放在同一文件夹，在终端进入该文件夹后校验：
 
    ```bash
@@ -45,7 +45,7 @@
 | 原地新建 | 在待办列表顶部输入内容，回车即可添加；默认中优先级、今天，可按需调整优先级和日期。未提交的草稿在收起面板或编辑其他事项后仍会保留。 |
 | 原地编辑 | 点击事项直接在条目内修改内容、优先级和日期；回车或点击别处保存并收起，空标题不会覆盖原事项。主动点到输入区外会释放焦点。 |
 | 轻量完成状态 | 已完成事项使用删除线和弱化文字；鼠标悬停或键盘聚焦时出现「完成 / 恢复」入口。 |
-| 全局快速收集 | 在任意应用中按 `Option + Command + T`，打开轻量输入窗口，使用相同的内容、优先级和日期控件。 |
+| 全局快速收集 | 按 `Option + Command + T` 切换快速收集窗口；关闭时保留草稿，添加成功后显示短暂、轻量的「已添加」提示。 |
 | 自定义桌面提醒 | 默认每天 15:00 和 21:00 显示「今日待办清单」；在独立设置窗口添加、修改或删除时间点，自定义每天提醒次数。仅提醒当天到期且未完成的事项，无待办时不打扰。 |
 | 日期分组 | 明确区分**已推迟**、**当天待完成**与**未来待完成**。 |
 | 集中设置 | 右键菜单栏图标 → 设置…，在独立窗口统一管理提醒、桌面小组件、显示屏幕、停靠侧边及语言（简体中文 / English）；更改自动保存。 |
@@ -59,9 +59,17 @@
 | 新建事项 | 在列表顶部输入内容，回车添加；默认中优先级、今天到期。 |
 | 编辑事项 | 点击事项文字原地修改，回车或点击输入区外保存。 |
 | 完成或恢复 | 鼠标悬停在条目上，或通过键盘聚焦操作入口，再点击「完成 / 恢复」。 |
-| 快速收集 | 按 `Option + Command + T`，输入后回车添加并关闭窗口。 |
+| 快速收集 | 按 `Option + Command + T` 打开或关闭；回车添加，随后显示短暂的成功提示。 |
 | 打开设置 | 右键菜单栏图标，选择「设置…」。 |
 | 移动侧边标签 | 在设置中开启「常驻桌面」，将收起的小标签上下拖动。 |
+
+### 快速收集
+
+在任意应用中按 `Option + Command + T` 打开快速收集，再按一次关闭。未提交的内容、优先级和日期会保留，下次打开可继续输入。回车添加后，输入窗关闭，原位置短暂显示「已添加」和事项名称，约 1 秒后淡出，不抢焦点、不拦截点击，也不发送系统通知。
+
+<img src="docs/screenshots/quick-capture-zh.png" width="388" alt="快速收集窗口，展示示例事项、优先级、日期和添加按钮">
+
+<p><img src="docs/screenshots/quick-capture-success-zh.png" width="280" alt="添加成功后的轻量提示，显示已添加和事项名称"></p>
 
 ### 提醒设置
 

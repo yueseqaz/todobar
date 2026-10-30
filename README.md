@@ -2,7 +2,7 @@
 
 A lightweight native macOS menu bar to-do app. Capture and edit tasks in place, keep a compact list at the edge of your desktop, and set reminders that follow your daily rhythm. Built with SwiftUI, with a restrained frosted-glass interface and local task storage.
 
-[中文](README.zh-CN.md) · [v1.1.0 release](https://github.com/yueseqaz/todobar/releases/tag/v1.1.0) · [Download for Apple Silicon](https://github.com/yueseqaz/todobar/releases/download/v1.1.0/TodoBar-macos-arm64.zip) · [Release notes](RELEASE_NOTES.md)
+[中文](README.zh-CN.md) · [v1.1.1 release](https://github.com/yueseqaz/todobar/releases/tag/v1.1.1) · [Download for Apple Silicon](https://github.com/yueseqaz/todobar/releases/download/v1.1.1/TodoBar-macos-arm64.zip) · [Release notes](RELEASE_NOTES.md)
 
 ## Screenshots
 
@@ -21,9 +21,9 @@ The app's task panel and Settings window, shown in dark appearance with sample t
 
 ## Download and install
 
-**Current release: v1.1.0. Requires an Apple Silicon (M-series) Mac running macOS 13 or later. The release package does not support Intel Macs.**
+**Current release: v1.1.1. Requires an Apple Silicon (M-series) Mac running macOS 13 or later. The release package does not support Intel Macs.**
 
-1. Download `TodoBar-macos-arm64.zip` and `SHA256SUMS.txt` from the [official release](https://github.com/yueseqaz/todobar/releases/tag/v1.1.0).
+1. Download `TodoBar-macos-arm64.zip` and `SHA256SUMS.txt` from the [official release](https://github.com/yueseqaz/todobar/releases/tag/v1.1.1).
 2. Place both files in the same folder and verify the archive from Terminal:
 
    ```bash
@@ -45,7 +45,7 @@ Release packages are built and ad-hoc signed by GitHub Actions, but are **not Ap
 | Inline creation | Add tasks at the top of the list and press Return; medium priority and today are the defaults, with optional priority and date controls. Unsent drafts survive collapsing the panel or editing another task. |
 | Inline editing | Edit content, priority, and date directly in a task row. Return or clicking elsewhere saves valid changes and closes the editor; empty titles leave the original task intact. Outside clicks release input focus. |
 | Quiet completion controls | Completed titles use strikethrough and dimmed text. Complete / Restore actions appear on hover or keyboard focus. |
-| Global quick capture | Press `Option + Command + T` from any app to open a compact capture window with the same title, priority, and date controls. |
+| Global quick capture | Press `Option + Command + T` to toggle a compact capture window. Closing preserves the draft; successful capture shows a brief, nonintrusive Added confirmation. |
 | Custom daily reminders | A floating Today's to-do list shows unfinished tasks due today at 3 PM and 9 PM by default. Add, edit, or remove times in Settings to choose your daily frequency. No tasks, no interruption. |
 | Date-aware groups | See **Overdue**, **Due today**, and **Upcoming** tasks separately. |
 | Consolidated Settings | Right-click the menu-bar icon → Settings… to manage reminders, the desktop widget, displays, dock side, and language (Simplified Chinese / English) in one window. Changes save automatically. |
@@ -59,9 +59,17 @@ Release packages are built and ad-hoc signed by GitHub Actions, but are **not Ap
 | Add a task | Type at the top of the list and press Return. Priority defaults to Medium and the date to Today. |
 | Edit a task | Click its text, edit in place, then press Return or click outside the editor to save. |
 | Complete or restore | Hover over a row, or focus its action with the keyboard, then choose Complete / Restore. |
-| Quick capture | Press `Option + Command + T`; Return adds the task and closes the capture window. |
+| Quick capture | Press `Option + Command + T` to open or close; Return adds the task and shows a brief confirmation. |
 | Open Settings | Right-click the menu-bar icon and choose Settings… |
 | Move the desktop tab | Enable Pin to desktop in Settings, then drag the collapsed edge tab up or down. |
+
+### Quick capture
+
+Press `Option + Command + T` from any app to open quick capture; press it again to close. The unsent title, priority, and date are retained when you reopen it. Press Return to add the task: the input closes, and a small Added confirmation with the task title fades out after about a second. It does not take focus, intercept clicks, or send a system notification.
+
+<img src="docs/screenshots/quick-capture-en.png" width="388" alt="Quick capture with a sample task, priority, date, and Add button">
+
+<p><img src="docs/screenshots/quick-capture-success-en.png" width="280" alt="Brief Added confirmation showing the captured task title"></p>
 
 ### Reminders
 

@@ -1648,7 +1648,7 @@ final class TodoBarServices {
 
         quickCaptureController.configure(with: taskStore)
         hotKeyManager.start {
-            self.quickCaptureController.show()
+            self.quickCaptureController.toggle()
         }
 
         LegacyNotificationCleaner.clearTodoBarNotifications()
@@ -1717,31 +1717,156 @@ final class GlobalHotKeyManager {
     }
 }
 
-extension Notification.Name {
-    static let todoBarQuickCaptureActivated = Notification.Name("TodoBarQuickCaptureActivated")
+@MainActor
+final class QuickCaptureSession: ObservableObject {
+    @Published var draft = InlineTaskDraft()
+    @Published private(set) var isPresented = false
+    @Published private(set) var generation = 0
+
+    func present() {
+        generation += 1
+        isPresented = true
+    }
+
+    @discardableResult
+    func dismiss(generation expected: Int? = nil) -> Bool {
+        guard expected == nil || expected == generation else { return false }
+        generation += 1
+        isPresented = false
+        return true
+    }
+
+    func takeSubmission(generation expected: Int) -> InlineTaskDraft? {
+        guard isPresented, expected == generation, draft.canSubmit else { return nil }
+        let submitted = draft
+        draft = InlineTaskDraft()
+        dismiss()
+        return submitted
+    }
+}
+
+private final class QuickCaptureFeedbackPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+@MainActor
+final class QuickCaptureFeedbackController {
+    private(set) var panel: NSPanel?
+    private var dismissTimer: Timer?
+
+    deinit { dismissTimer?.invalidate() }
+
+    func show(title: String, near frame: NSRect) {
+        hide()
+        let panel = makePanel(title: title)
+        self.panel = panel
+        panel.setFrameOrigin(NSPoint(x: frame.midX - panel.frame.width / 2, y: frame.midY - panel.frame.height / 2))
+        panel.orderFrontRegardless()
+        NSAccessibility.post(element: NSApplication.shared, notification: .announcementRequested, userInfo: [
+            .announcement: LanguageSettings.shared.text("已添加：\(title)", "Added: \(title)"),
+            .priority: NSAccessibilityPriorityLevel.medium.rawValue
+        ])
+        dismissTimer = Timer(timeInterval: 1.1, repeats: false) { [weak self, weak panel] _ in
+            Task { @MainActor [weak self, weak panel] in
+                guard let self, let panel, self.panel === panel else { return }
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.15
+                    panel.animator().alphaValue = 0
+                } completionHandler: { [weak self, weak panel] in
+                    Task { @MainActor [weak self, weak panel] in
+                        guard let self, let panel, self.panel === panel else { return }
+                        self.hide()
+                    }
+                }
+            }
+        }
+        if let dismissTimer { RunLoop.main.add(dismissTimer, forMode: .common) }
+    }
+
+    func hide() {
+        dismissTimer?.invalidate()
+        dismissTimer = nil
+        panel?.orderOut(nil)
+        panel = nil
+    }
+
+    func makePanel(title: String) -> NSPanel {
+        let panel = QuickCaptureFeedbackPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 280, height: 48),
+            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false
+        )
+        panel.isReleasedWhenClosed = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.level = .floating
+        panel.hidesOnDeactivate = false
+        panel.ignoresMouseEvents = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        panel.contentView = NSHostingView(rootView: QuickCaptureFeedbackView(title: title))
+        return panel
+    }
+}
+
+struct QuickCaptureFeedbackView: View {
+    let title: String
+    @ObservedObject private var languageSettings = LanguageSettings.shared
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Text(languageSettings.text("已添加", "Added"))
+                .font(.system(size: 12, weight: .semibold))
+            Text(title)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .frame(width: 280, height: 48)
+        .glassSurface(cornerRadius: 12, usesLiveBlur: false)
+        .accessibilityElement(children: .combine)
+    }
 }
 
 @MainActor
 final class QuickCaptureController {
     private weak var taskStore: TaskStore?
     private var panel: NSPanel?
+    let session = QuickCaptureSession()
+    private let feedback = QuickCaptureFeedbackController()
+    private let activateApp: @MainActor () -> Void
+
+    init(panel: NSPanel? = nil, activateApp: @escaping @MainActor () -> Void = { NSApp.activate(ignoringOtherApps: true) }) {
+        self.panel = panel
+        self.activateApp = activateApp
+    }
 
     func configure(with taskStore: TaskStore) {
         self.taskStore = taskStore
     }
 
-    func show() {
+    func toggle() {
+        if panel?.isVisible == true {
+            dismiss()
+        } else {
+            show()
+        }
+    }
+
+    private func show() {
+        guard taskStore != nil else { return }
+        feedback.hide()
         if panel == nil {
             panel = makePanel()
         }
 
         guard let panel else { return }
-        NSApp.activate(ignoringOtherApps: true)
+        activateApp()
         panel.center()
         panel.makeKeyAndOrderFront(nil)
-        DispatchQueue.main.async {
-            NotificationCenter.default.post(name: .todoBarQuickCaptureActivated, object: nil)
-        }
+        session.present()
     }
 
     private func makePanel() -> NSPanel {
@@ -1759,31 +1884,34 @@ final class QuickCaptureController {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         panel.backgroundColor = .clear
         panel.contentView = NSHostingView(rootView: QuickCaptureView(
-            onSave: { [weak self] draft in
-                self?.taskStore?.add(
-                    title: draft.trimmedTitle,
-                    priority: draft.priority,
-                    dueDate: draft.schedule.dueDate()
-                )
-                self?.dismiss()
-            },
-            onDismiss: { [weak self] in self?.dismiss() }
+            session: session,
+            onSave: { [weak self] generation in self?.save(generation: generation) },
+            onDismiss: { [weak self] generation in self?.dismiss(generation: generation) }
         ))
         return panel
     }
 
-    private func dismiss() {
+    private func save(generation: Int) {
+        guard let taskStore, let panel,
+              let draft = session.takeSubmission(generation: generation) else { return }
+        taskStore.add(title: draft.trimmedTitle, priority: draft.priority, dueDate: draft.schedule.dueDate())
+        let frame = panel.frame
+        panel.orderOut(nil)
+        feedback.show(title: draft.trimmedTitle, near: frame)
+    }
+
+    private func dismiss(generation: Int? = nil) {
+        guard session.dismiss(generation: generation) else { return }
         panel?.orderOut(nil)
     }
 }
 
 struct QuickCaptureView: View {
-    let onSave: (InlineTaskDraft) -> Void
-    let onDismiss: () -> Void
+    @ObservedObject var session: QuickCaptureSession
+    let onSave: (Int) -> Void
+    let onDismiss: (Int) -> Void
 
     @ObservedObject private var languageSettings = LanguageSettings.shared
-    @State private var draft = InlineTaskDraft()
-    @State private var activationID = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -1797,31 +1925,22 @@ struct QuickCaptureView: View {
                     .foregroundStyle(.tertiary)
             }
 
-            InlineTaskInput(
-                draft: $draft,
-                showsPlus: true,
-                submitTitle: t("添加", "Add"),
-                onActivate: {},
-                onSubmit: save,
-                onEnd: onDismiss
-            )
-            .id(activationID)
+            if session.isPresented {
+                let generation = session.generation
+                InlineTaskInput(
+                    draft: $session.draft,
+                    showsPlus: true,
+                    submitTitle: t("添加", "Add"),
+                    onActivate: {},
+                    onSubmit: { onSave(generation); return false },
+                    onEnd: { onDismiss(generation) }
+                )
+                .id(generation)
+            }
         }
         .padding(16)
         .frame(width: 388)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .onReceive(NotificationCenter.default.publisher(for: .todoBarQuickCaptureActivated)) { _ in
-            // Re-mount only the input control so a previously typed draft survives.
-            activationID += 1
-        }
-    }
-
-    private func save() -> Bool {
-        guard draft.canSubmit else { return false }
-        let submitted = draft
-        draft = InlineTaskDraft()
-        onSave(submitted)
-        return false
     }
 
     private func t(_ chinese: String, _ english: String) -> String {

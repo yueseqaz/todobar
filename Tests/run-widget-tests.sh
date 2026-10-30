@@ -11,6 +11,7 @@ cat "$ROOT/Tests/InlineTaskComposerTests.swift" >> "$TEST_DIR/WidgetEdgeTabTests
 cat "$ROOT/Tests/InlineTaskEditingTests.swift" >> "$TEST_DIR/WidgetEdgeTabTests.swift"
 cat "$ROOT/Tests/ReminderSettingsTests.swift" >> "$TEST_DIR/WidgetEdgeTabTests.swift"
 cat "$ROOT/Tests/ReminderTimeInputTests.swift" >> "$TEST_DIR/WidgetEdgeTabTests.swift"
+cat "$ROOT/Tests/QuickCaptureTests.swift" >> "$TEST_DIR/WidgetEdgeTabTests.swift"
 cat "$ROOT/Tests/WidgetEdgeTabTests.swift" >> "$TEST_DIR/WidgetEdgeTabTests.swift"
 swiftc -swift-version 5 -parse-as-library \
   -sdk "${SDKROOT:-$(xcrun --show-sdk-path)}" \
